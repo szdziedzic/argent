@@ -2,7 +2,12 @@ import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import { FAILURE_CODES, FailureError } from "@argent/registry";
 import { stringify as yamlStringify, parse as yamlParse } from "yaml";
-import { CLIENT_FILE_MARKER, FLOW_NAME_PATTERN, type ClientFileDirective } from "@argent/registry";
+import {
+  CLIENT_FILE_MARKER,
+  FLOW_FILE_NAME_PATTERN,
+  FLOW_NAME_PATTERN,
+  type ClientFileDirective,
+} from "@argent/registry";
 import {
   hasVisibleText,
   selectorFieldsSchema,
@@ -200,8 +205,9 @@ export function clearActiveFlow(): void {
  * A chromium `launch` target: a filesystem path to the Electron app (bare
  * string) or a path plus extra CLI args. Unlike iOS/Android/Vega (an OS-installed
  * app id relaunched in place), chromium is booted from this path, so it must
- * exist on the tool-server host; a relative path resolves against the flow
- * file's directory (the same anchor `run:` and baselines use).
+ * exist on the tool-server host; a relative path resolves against the ROOT
+ * flow file's directory (the baseline anchor — only the root flow's leading
+ * launch ever boots; `run:` targets anchor per containing file instead).
  */
 export type ChromiumLaunch = string | { path: string; args?: string[] };
 
@@ -307,6 +313,7 @@ export type FlowStep =
   | { kind: "tool"; name: string; args: Record<string, unknown>; delayMs?: number }
   | { kind: "echo"; message: string }
   | { kind: "launch"; app: Launch }
+  // `flow` is the as-written YAML path, resolved against the containing file's directory.
   | { kind: "run"; flow: string }
   | { kind: "when"; condition: WhenCondition; steps: FlowStep[] }
   | { kind: "tap"; selector?: FlowSelector; x?: number; y?: number; times?: number }
@@ -1690,6 +1697,51 @@ function parseWhenStep(raw: Record<string, unknown>, depth: number): FlowStep {
   return { kind: "when", condition, steps };
 }
 
+/**
+ * The report/display name of a `run:` target — its YAML basename stem. Parse
+ * guarantees the stem is a safe flow name, so this is also the fragment's
+ * attribution in step reports (mirroring how the CLI derives the top-level
+ * flow name from the file it runs).
+ */
+export function runTargetName(target: string): string {
+  return path.posix.basename(target, ".yaml");
+}
+
+/**
+ * Shape-check a `run:` value: a relative YAML path resolved at run time
+ * against the containing flow file's directory. `..` is deliberately legal —
+ * shared fragments may live outside the flows dir.
+ */
+function parseRunTarget(raw: unknown, value: string): string {
+  if (value.includes("\\")) {
+    badEntry(raw, "a `run` path uses forward slashes, e.g. `run: fragments/login.yaml`");
+  }
+  // The drive-letter test also catches win32 drive-RELATIVE paths ("C:foo"),
+  // which isAbsolute passes but which resolve against the drive's cwd.
+  if (path.posix.isAbsolute(value) || path.win32.isAbsolute(value) || /^[A-Za-z]:/.test(value)) {
+    badEntry(raw, "a `run` path must be relative to the flow file that references it");
+  }
+  if (!value.endsWith(".yaml")) {
+    if (FLOW_NAME_PATTERN.test(value)) {
+      badEntry(
+        raw,
+        `\`run\` takes a YAML path relative to this flow's file — did you mean \`run: ${value}.yaml\`?`
+      );
+    }
+    if (value.toLowerCase().endsWith(".yaml")) {
+      badEntry(raw, "a `run` path must use the lowercase .yaml extension");
+    }
+    badEntry(raw, "a `run` path must end in .yaml");
+  }
+  if (!FLOW_FILE_NAME_PATTERN.test(path.posix.basename(value))) {
+    badEntry(
+      raw,
+      `a \`run\` target's filename must match ${FLOW_NAME_PATTERN} (letters, digits, underscore, hyphen)`
+    );
+  }
+  return value;
+}
+
 function fromYamlStep(raw: YamlStep, whenDepth = 0): FlowStep {
   const entry = raw as Record<string, unknown>;
   // There is deliberately no per-step `optional:` — it would have to be
@@ -1740,7 +1792,7 @@ function fromYamlStep(raw: YamlStep, whenDepth = 0): FlowStep {
 
   if ("echo" in raw) return { kind: "echo", message: String(raw.echo) };
   if ("launch" in raw) return { kind: "launch", app: parseLaunch(raw.launch) };
-  if ("run" in raw) return { kind: "run", flow: String(raw.run) };
+  if ("run" in raw) return { kind: "run", flow: parseRunTarget(raw, String(raw.run)) };
   if ("when" in raw) return parseWhenStep(entry, whenDepth);
 
   if ("tap" in raw) return parseTap((raw as { tap: unknown }).tap, raw);

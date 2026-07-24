@@ -417,7 +417,7 @@ describe("flow-add-step", () => {
     // Ran the fragment live to set up state…
     expect(result.toolResult).toEqual({ ok: true, steps: [] });
     // …but recorded the portable composition directive, not the raw tool call.
-    expect(parseFlow(result.flowFile).steps).toEqual([{ kind: "run", flow: "login" }]);
+    expect(parseFlow(result.flowFile).steps).toEqual([{ kind: "run", flow: "login.yaml" }]);
   });
 
   it("records a run: directive when the target is an e2e flow", async () => {
@@ -438,7 +438,7 @@ describe("flow-add-step", () => {
     );
 
     // e2e flows now compose via run: just like fragments — their launch runs inline.
-    expect(parseFlow(result.flowFile).steps).toEqual([{ kind: "run", flow: "other-e2e" }]);
+    expect(parseFlow(result.flowFile).steps).toEqual([{ kind: "run", flow: "other-e2e.yaml" }]);
   });
 
   it("keeps the raw flow-execute step when the target is not a sibling", async () => {
@@ -481,13 +481,17 @@ describe("flow-add-step", () => {
       }
     );
 
-    expect(parseFlow(result.flowFile).steps).toEqual([{ kind: "run", flow: "login" }]);
+    expect(parseFlow(result.flowFile).steps).toEqual([{ kind: "run", flow: "login.yaml" }]);
     // The live sub-invoke gets no file-input boundary, so it must run the
     // sibling by name…
     const nested = (registry.invokeTool as any).mock.calls[0][1];
     expect(nested).toEqual({ name: "login", project_root: tmpDir });
     // …which a real tool-server resolves to that same file.
-    expect(resolveFlowSource(nested)).toEqual({ filePath: sibling, flowName: "login" });
+    expect(resolveFlowSource(nested)).toEqual({
+      filePath: sibling,
+      flowName: "login",
+      viaUpload: false,
+    });
   });
 
   it("rejects a flow_path outside the recording's flow directory without running it", async () => {
