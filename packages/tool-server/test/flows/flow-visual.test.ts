@@ -442,6 +442,35 @@ describe("runSnapshot settle", () => {
     await expect(fs.access(baselinePath())).resolves.toBeUndefined();
   });
 
+  it("accepts an established stale settle when the tree source goes dark on the retry", async () => {
+    vi.useFakeTimers();
+    // The first settle proves the pixels stopped (visually settled, tree
+    // stale); the freshness retry then finds the tree source dark. The outage
+    // cannot un-prove that established stillness, so the snapshot proceeds on
+    // it directly — no pixels-only fallback round re-deriving what the first
+    // settle already proved, and no degradation note.
+    vi.mocked(settleTree)
+      .mockResolvedValueOnce({
+        tree: {} as never,
+        converged: false,
+        treeFresh: false,
+        visual: "settled",
+      })
+      .mockRejectedValueOnce(treeOutage());
+
+    const pending = runSnapshot(env, opts({ updateBaselines: true }));
+    await vi.advanceTimersByTimeAsync(1_000);
+    const r = await pending;
+
+    expect(r.status).toBe("pass");
+    expect(r.reason).toBe("baseline written (home__ios-390x844.png)");
+    // The outage arrived on the freshness retry, not the first settle…
+    expect(vi.mocked(settleTree)).toHaveBeenCalledTimes(2);
+    // …and the stillness was accepted as-is, not re-proved from extra captures.
+    expect(vi.mocked(settlePixels)).not.toHaveBeenCalled();
+    await expect(fs.access(baselinePath())).resolves.toBeUndefined();
+  });
+
   it("writes an undegraded baseline when a converged combined settle had no pixel phase", async () => {
     // A platform with no capture backend (Vega) converges with visual
     // "skipped": the absence is architectural, so the reason must read exactly
