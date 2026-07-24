@@ -75,7 +75,7 @@ describe("pixelsDiffer", () => {
 });
 
 describe("capturePixels", () => {
-  it("returns undefined on Vega without touching the registry (no touch input there)", async () => {
+  it("returns undefined on Vega without touching the registry (no capture backend there)", async () => {
     let resolved = false;
     const env = {
       device: { platform: "vega", id: "vega-serial" },

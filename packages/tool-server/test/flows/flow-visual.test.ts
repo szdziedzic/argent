@@ -442,6 +442,58 @@ describe("runSnapshot settle", () => {
     await expect(fs.access(baselinePath())).resolves.toBeUndefined();
   });
 
+  it("writes an undegraded baseline when a converged combined settle had no pixel phase", async () => {
+    // A platform with no capture backend (Vega) converges with visual
+    // "skipped": the absence is architectural, so the reason must read exactly
+    // like any healthy write — no best-effort/degraded suffix.
+    vi.mocked(settleTree).mockResolvedValue({
+      tree: {} as never,
+      converged: true,
+      treeFresh: true,
+      visual: "skipped",
+    });
+    const vegaEnv = { ...env, device: { platform: "vega", id: "vega-1" } } as unknown as ActionEnv;
+
+    const r = await runSnapshot(vegaEnv, opts({ updateBaselines: true }));
+
+    expect(r.status).toBe("pass");
+    expect(r.reason).toBe("baseline written (home__vega-390x844.png)");
+  });
+
+  it("fails a missing baseline undegraded when the combined settle had no pixel phase", async () => {
+    vi.mocked(settleTree).mockResolvedValue({
+      tree: {} as never,
+      converged: true,
+      treeFresh: true,
+      visual: "skipped",
+    });
+    const vegaEnv = { ...env, device: { platform: "vega", id: "vega-1" } } as unknown as ActionEnv;
+
+    const r = await runSnapshot(vegaEnv, opts());
+
+    expect(r.status).toBe("fail");
+    expect(r.reason).toContain('no baseline for "home"');
+    expect(r.reason).not.toContain("best-effort/degraded");
+  });
+
+  it("compares undegraded when the converged combined settle had no pixel phase", async () => {
+    vi.mocked(settleTree).mockResolvedValue({
+      tree: {} as never,
+      converged: true,
+      treeFresh: true,
+      visual: "skipped",
+    });
+    const vegaEnv = { ...env, device: { platform: "vega", id: "vega-1" } } as unknown as ActionEnv;
+    const vegaBaseline = path.join(tmpDir, "__baselines__", "checkout", "home__vega-390x844.png");
+    await fs.mkdir(path.dirname(vegaBaseline), { recursive: true });
+    await writeFakePng(vegaBaseline);
+
+    const r = await runSnapshot(vegaEnv, opts());
+
+    expect(r.status).toBe("pass");
+    expect(r.reason).toBe("diff 0.00% ≤ 0.5% (home__vega-390x844.png)");
+  });
+
   it("writes a degraded baseline when a restarted settle never re-observed pixels", async () => {
     // settleTree downgraded a pre-restart "settled" to "skipped" — the write
     // still proceeds best-effort, flagged as a settle timeout.

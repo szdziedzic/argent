@@ -44,12 +44,24 @@ export interface PixelSettleOptions {
 }
 
 /**
+ * Whether the platform has a pixel-capture backend at all. Vega has none wired
+ * here, and that absence is architectural — combined settles consult this to
+ * skip the pixel phase outright rather than report every healthy Vega settle
+ * as a degraded "unavailable".
+ */
+export function hasPixelCapture(device: ActionEnv["device"]): boolean {
+  return device.platform !== "vega";
+}
+
+/**
  * Capture one downscaled screenshot to a temp file. iOS and Android share the
- * simulator-server backend; Chromium uses CDP. Vega has no touch input, so the
- * touch directives this feeds never run there (add a branch if that changes).
+ * simulator-server backend; Chromium uses CDP. Combined settles never reach
+ * here for Vega ({@link hasPixelCapture}); the guard covers the pixels-only
+ * outage fallback snapshots take when the tree source is down, where
+ * `unavailable` is the honest report — nothing gated that capture.
  */
 async function captureFile(env: ActionEnv): Promise<string | undefined> {
-  if (env.device.platform === "vega") return undefined;
+  if (!hasPixelCapture(env.device)) return undefined;
   if (env.device.platform === "chromium") {
     const ref = chromiumCdpRef(env.device);
     const api = (await env.registry.resolveService(ref.urn, ref.options)) as ChromiumCdpApi;

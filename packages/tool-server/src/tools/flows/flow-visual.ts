@@ -105,7 +105,12 @@ async function cleanupDiffDir(dir: string, keep?: string): Promise<void> {
   }
 }
 
-type SnapshotSettleOutcome = Exclude<PixelSettleOutcome, "aborted"> | "aborted";
+/**
+ * The pixel-settle outcomes plus `skipped`: a combined settle converged with
+ * no pixel phase to run (no capture backend on the platform) — complete, not
+ * degraded, so {@link degradedReason} maps it to nothing.
+ */
+type SnapshotSettleOutcome = Exclude<PixelSettleOutcome, "aborted"> | "aborted" | "skipped";
 
 /** A snapshot's settle verdict: the visual outcome plus tree freshness. */
 interface SnapshotSettle {
@@ -141,6 +146,12 @@ async function settleSnapshot(env: ActionEnv): Promise<SnapshotSettle> {
       if (!settled) return { outcome: "aborted", treeFresh: false };
       if (settled.visual === "settled" && settled.treeFresh) {
         return { outcome: "settled", treeFresh: true };
+      }
+      // Combined mode converges with `skipped` only when the platform has no
+      // capture backend (see SettleResult.visual): tree stability is the whole
+      // settle there, and no retry could produce anything more.
+      if (settled.visual === "skipped" && settled.converged) {
+        return { outcome: "skipped", treeFresh: settled.treeFresh };
       }
       if (settled.visual === "settled") {
         staleSettled = true;

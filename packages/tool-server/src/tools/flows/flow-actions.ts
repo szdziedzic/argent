@@ -24,7 +24,12 @@ import { invokeSubTool } from "../../utils/sub-invoke";
 import { bindDeviceArgs } from "./flow-device";
 import { FlowTreeSourceUnavailableError } from "./flow-errors";
 import { fetchFlowTree } from "./flow-tree";
-import { capturePixels, pixelsDiffer, type PixelSettleOutcome } from "./flow-pixels";
+import {
+  capturePixels,
+  hasPixelCapture,
+  pixelsDiffer,
+  type PixelSettleOutcome,
+} from "./flow-pixels";
 import {
   buildAxisCandidate,
   decomposePinch,
@@ -339,8 +344,10 @@ export interface SettleResult {
    */
   treeFresh: boolean;
   /**
-   * Pixel phase outcome. `skipped` means tree-only mode, or that tree settling
-   * exhausted its deadline before a combined settle could start (or re-run)
+   * Pixel phase outcome. `skipped` means no pixel phase ran: tree-only mode,
+   * a platform with no capture backend at all ({@link hasPixelCapture} — the
+   * only way a combined settle converges with `skipped`), or tree settling
+   * exhausting its deadline before a combined settle could start (or re-run)
    * captures. `settled` always describes the screen as returned (a pre-restart
    * match is downgraded to `skipped`), so a caller may trust it without
    * `treeFresh` for anything that consumes no tree-derived value.
@@ -423,7 +430,8 @@ async function capturePixelsBefore(env: ActionEnv, deadline: number): Promise<Pi
  * when screenshots are available and re-read the tree once more. If that final
  * tree moved during the pixel wait, restart from it instead of handing a stale
  * frame to the caller. `tree-only` mode returns after the matching tree pair
- * and never attempts a pixel capture.
+ * and never attempts a pixel capture; a platform with no capture backend at
+ * all ({@link hasPixelCapture}) settles the same way even in combined mode.
  *
  * Returns the fully stable tree (`converged: true`), the best-effort latest tree
  * when either phase exhausts its bounded budget (`converged: false`), or
@@ -509,7 +517,11 @@ export async function settleTree(
       if (!(await sleepOrAbort(sleepMs, env.signal))) return undefined;
     }
 
-    if (mode === "tree-only" || pixelsUnavailable) {
+    // A platform with no capture backend converges tree-only by construction:
+    // `visual` stays "skipped" — an architectural absence, not the
+    // probed-and-failed "unavailable" — and no revalidation read is owed
+    // because no pixel wait ran for the tree to move under.
+    if (mode === "tree-only" || pixelsUnavailable || !hasPixelCapture(env.device)) {
       return { tree: stableTree, converged: !pixelsTimedOut, treeFresh: true, visual };
     }
 

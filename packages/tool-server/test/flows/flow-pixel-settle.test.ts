@@ -286,6 +286,110 @@ describe("pixel settle backstop", () => {
     );
   });
 
+  it("settles combined mode tree-only on Vega without probing the capture backend", async () => {
+    const env = {
+      registry: mockRegistry([]),
+      device: { platform: "vega", id: "vega-serial" },
+    } as unknown as ActionEnv;
+
+    const settled = await settleTree(env);
+
+    // No backend exists to probe: the settle converges on the tree alone with
+    // visual "skipped" — not the probed-and-failed "unavailable".
+    expect(settled).toMatchObject({ converged: true, treeFresh: true, visual: "skipped" });
+    expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
+  });
+
+  it("writes an undegraded Vega snapshot baseline through the real combined settle", async () => {
+    const shotPath = path.join(tmpDir, "snapshot.png");
+    const png = Buffer.alloc(24);
+    png.writeUInt32BE(390, 16);
+    png.writeUInt32BE(844, 20);
+    await fs.writeFile(shotPath, png);
+    const registry = {
+      invokeTool: vi.fn(async (id: string) => {
+        if (id === "screenshot") {
+          return {
+            image: {
+              __argentArtifact: true,
+              id: "current-snapshot",
+              hostPath: shotPath,
+              mimeType: "image/png",
+            },
+          };
+        }
+        return { ok: true };
+      }),
+      getTool: vi.fn(() => ({ inputSchema: { properties: { udid: {} } } })),
+    } as unknown as Registry;
+    const env = {
+      registry,
+      ctx: { artifacts: new ArtifactStore() },
+      device: { platform: "vega", id: "vega-serial" },
+    } as unknown as ActionEnv;
+
+    const result = await runSnapshot(env, {
+      flowsDir: tmpDir,
+      flowName: "checkout",
+      name: "home",
+      maxMismatch: 0.5,
+      updateBaselines: true,
+    });
+
+    // A healthy Vega device has no pixel backend by construction, so the write
+    // must carry no best-effort/degraded suffix — assert the whole reason.
+    expect(result.status).toBe("pass");
+    expect(result.reason).toBe("baseline written (home__vega-390x844.png)");
+    expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
+  });
+
+  it("still degrades a snapshot when a resolvable capture backend fails transiently", async () => {
+    const shotPath = path.join(tmpDir, "snapshot.png");
+    const png = Buffer.alloc(24);
+    png.writeUInt32BE(390, 16);
+    png.writeUInt32BE(844, 20);
+    await fs.writeFile(shotPath, png);
+    // iOS has a backend, but every capture soft-fails — that IS a degraded
+    // capture: nothing proved the pixels stopped.
+    vi.mocked(capturePixels).mockResolvedValue(undefined);
+    const registry = {
+      invokeTool: vi.fn(async (id: string) => {
+        if (id === "screenshot") {
+          return {
+            image: {
+              __argentArtifact: true,
+              id: "current-snapshot",
+              hostPath: shotPath,
+              mimeType: "image/png",
+            },
+          };
+        }
+        return { ok: true };
+      }),
+      getTool: vi.fn(() => ({ inputSchema: { properties: { udid: {} } } })),
+    } as unknown as Registry;
+    const env = {
+      registry,
+      ctx: { artifacts: new ArtifactStore() },
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+
+    const result = await runSnapshot(env, {
+      flowsDir: tmpDir,
+      flowName: "checkout",
+      name: "home",
+      maxMismatch: 0.5,
+      updateBaselines: true,
+    });
+
+    expect(result.status).toBe("pass");
+    expect(result.reason).toBe(
+      "baseline written (home__ios-390x844.png); " +
+        "capture is best-effort/degraded because visual settling was unavailable"
+    );
+    expect(vi.mocked(capturePixels)).toHaveBeenCalledTimes(1);
+  });
+
   it("taps immediately when pixels can't be read (soft skip, no wait)", async () => {
     vi.mocked(capturePixels).mockResolvedValue(undefined);
 
