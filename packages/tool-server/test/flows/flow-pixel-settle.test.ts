@@ -1083,6 +1083,54 @@ describe("pixel settle backstop", () => {
     expect(vi.mocked(capturePixels)).toHaveBeenCalledTimes(1);
   });
 
+  it("dispatches no scroll from the stale first round's best-effort tree", async () => {
+    vi.useFakeTimers();
+    // Unlike the retry test above (target fully visible throughout, where the
+    // axis check returns before any increment either way), the stale
+    // best-effort tree here shows the target still flush against the fold —
+    // falling through the stale round would fingerprint that tree and swipe at
+    // its coordinates. The fresh tree served after the hung revalidation shows
+    // the target already fully inside, so the correct run dispatches NOTHING:
+    // any gesture at all can only have come from the stale round.
+    const staleTree = screen([
+      n({ label: "Target", frame: { x: 0.1, y: 0.85, width: 0.8, height: 0.15 } }),
+    ]);
+    const freshTree = screen([
+      n({ label: "Target", frame: { x: 0.1, y: 0.4, width: 0.8, height: 0.2 } }),
+    ]);
+    let reads = 0;
+    currentTree = () => {
+      reads++;
+      // Reads 1–2 converge round 0's tree phase on the stale layout; read 3 is
+      // the post-pixel revalidation, hung so the combined settle comes back
+      // treeFresh: false with the stale tree as best effort. Every later read
+      // (round 1's tree-only settle) sees the fresh layout.
+      if (reads <= 2) return staleTree;
+      if (reads === 3) return new Promise<DescribeNode>(() => {});
+      return freshTree;
+    };
+    vi.mocked(capturePixels).mockImplementation(() => new Promise(() => {}));
+    const calls: string[] = [];
+    const env = {
+      registry: mockRegistry(calls),
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+
+    const pending = runDirective(env, {
+      kind: "scroll-to",
+      target: { text: "Target" },
+      direction: "down",
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    const result = await pending;
+
+    expect(result.ok).toBe(true);
+    // Exactly zero device invocations: the stale round suppressed its
+    // increment and the fresh round found the target in place.
+    expect(calls).toEqual([]);
+    expect(vi.mocked(capturePixels)).toHaveBeenCalledTimes(1);
+  });
+
   it("downgrades settled pixels when a restarted tree phase never re-converges", async () => {
     vi.useFakeTimers();
     const before = screen([n({ label: "Go", frame: { x: 0.1, y: 0.1, width: 0.2, height: 0.2 } })]);
