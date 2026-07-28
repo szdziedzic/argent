@@ -109,7 +109,12 @@ describe("flow composition (run:)", () => {
         {
           artifacts: new ArtifactStore(),
           fileInputs: {
-            flow_path: { clientPath: mainPath, presentOnHost: true, viaUpload: false },
+            flow_path: {
+              clientPath: mainPath,
+              presentOnHost: true,
+              viaUpload: false,
+              statVerified: true,
+            },
           },
         }
       )
@@ -139,7 +144,12 @@ describe("flow composition (run:)", () => {
         {
           artifacts: new ArtifactStore(),
           fileInputs: {
-            flow_path: { clientPath: upperPath, presentOnHost: true, viaUpload: false },
+            flow_path: {
+              clientPath: upperPath,
+              presentOnHost: true,
+              viaUpload: false,
+              statVerified: true,
+            },
           },
         }
       )
