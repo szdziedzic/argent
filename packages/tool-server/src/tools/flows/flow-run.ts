@@ -446,7 +446,9 @@ export function createRunFlowTool(
 Steps run in order: \`launch\` starts an app from scratch (terminate + relaunch) and waits until it is
 ready; \`tool\` calls dispatch through the registry; \`tap\`/\`long-press\`/\`type\` resolve a selector to an
 element and act on it (\`tap: { on, times: 2 }\` double-taps; \`long-press: { on, duration }\` presses and
-holds; \`tap\`/\`long-press\` alternatively take a raw normalized point — bare \`{ x, y }\` or \`on: { x, y }\`;
+holds; \`type: { into, text, clear, submit }\` types into a field — \`clear: true\` empties it first, since
+typing otherwise APPENDS, and \`text\` may be omitted for a clear-only step, which sends no Enter;
+\`tap\`/\`long-press\` alternatively take a raw normalized point — bare \`{ x, y }\` or \`on: { x, y }\`;
 any selector may scope its matches geometrically, the CSS combinators read off frames: \`within: <selector>\`
 (descendant — inside that container's frame), \`after: <selector>\` (CSS \`~\` — following it in reading
 order), \`next: <selector>\` (CSS \`+\` — the nearest such follower, which unlike CSS reaches past a

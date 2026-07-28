@@ -923,39 +923,6 @@ async function runRotate(
 }
 
 /**
- * Read back the focused element's *entered value*, to confirm a `clear` actually
- * emptied the field. Returns the remaining value, or undefined when the check
- * cannot be trusted, in which case the caller must not fail the step.
- *
- * Only `value` counts. `label` / `subtreeText` carry the field's PLACEHOLDER
- * (Android surfaces the hint as the node's label, so an emptied
- * "Username or email address" box still reads that way), and treating those as
- * content turns every successful clear into a step failure. An empty field
- * reports no `value` at all rather than `""`, so "no value" is indistinguishable
- * from "unreadable" — both mean "no evidence of leftover text", which is a pass.
- *
- * Also skipped for a password field: Android uiautomator reports empty text for
- * `password="true"` nodes, so "looks empty" there would be a false pass rather
- * than evidence.
- */
-async function readFocusedValue(
-  env: ActionEnv,
-  into: FlowSelector,
-  tappedFrame: DescribeFrame
-): Promise<string | undefined> {
-  let tree: DescribeNode;
-  try {
-    ({ tree } = await fetchFlowTree(env.registry, env.device));
-  } catch {
-    return undefined;
-  }
-  const target = flowSelectorToFrame(tree, into) ?? tappedFrame;
-  const focused = collectFocused(tree, []).find((n) => framesOverlap(n.frame, target));
-  if (!focused || focused.password) return undefined;
-  return focused.value;
-}
-
-/**
  * Resolve `into` → tap to focus → wait for focus to land → optionally clear the
  * field → type text via the keyboard tool.
  *
@@ -986,21 +953,31 @@ async function runType(
   // its own), so a cancelled run can never type into, or submit, whatever the
   // app has focused after the caller gave up.
   if (env.signal?.aborted) return ABORTED_OUTCOME;
-  // Clear as its own call, before the text. `runType` is the one layer holding a
-  // settled tree, so it is also the only place that can cheaply confirm the
-  // clear landed — a flow that silently fails to clear reverts to appending and
-  // then fails at some later `assert`, pointing at the wrong step.
+  // Clear as its own call, before the text.
+  //
+  // Deliberately NOT followed by a read-back check that the field is now empty.
+  // The obvious one — re-read the focused node and fail if it still has text —
+  // cannot be made to work against the flow trees:
+  //
+  //   - iOS never carries a value at all (`flow-ios-tree` projects
+  //     {role, frame, children, label, identifier, focused} and does not even
+  //     request a text field), so the check is dead on the whole platform.
+  //   - A Chromium `<input>` likewise has no value: the DOM walker fills `value`
+  //     from the element's own child text nodes, and an input has none.
+  //   - On Android a field with no contentDescription puts its contents in
+  //     `label` (labelOf falls back to `text`), so again no value.
+  //
+  // …and where it DOES fire it is wrong as often as not: an emptied Android
+  // field with a contentDescription reports its HINT as the value (so a
+  // successful clear reads as leftover text), and a Chromium `<textarea>`
+  // exposes its default content once `el.value` goes empty. A check that is
+  // blind on the platforms that matter and fails correct behaviour on the rest
+  // is worse than none — the keyboard tool already rejects `clear` outright on
+  // every backend that cannot perform it, which is where the silent-no-op risk
+  // actually lives. Flows needing proof should assert the field's value, which
+  // is the flow language's own idiom and works everywhere.
   if (step.clear) {
     await invokeOnDevice(env, "keyboard", { clear: true });
-    const remaining = await readFocusedValue(env, step.into, frame);
-    if (remaining !== undefined && remaining.trim() !== "") {
-      return {
-        ok: false,
-        reason:
-          `clear left ${describeSelector(step.into)} non-empty (still ${JSON.stringify(remaining)}) — ` +
-          `the field would have been appended to, not replaced`,
-      };
-    }
   }
   if (step.text !== undefined) {
     if (env.signal?.aborted) return ABORTED_OUTCOME;

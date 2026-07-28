@@ -152,79 +152,13 @@ describe("type directive — clear dispatch", () => {
     const keyboard = keyboardArgs(calls);
     expect(keyboard).toEqual([{ text: "x" }, { key: "enter" }]);
   });
-});
 
-describe("type directive — post-clear verification", () => {
-  it("fails the step when the field is still populated after the clear", async () => {
-    const calls: Call[] = [];
-    // The field never empties — e.g. a backend where the clear silently no-ops.
-    const registry = mockRegistry(calls, () => ({ xml: fieldXml("old@example.com") }));
-
-    await writeFlow("f", {
-      executionPrerequisite: "",
-      steps: [
-        { kind: "type", into: { identifier: "email" }, text: "new@example.com", clear: true },
-      ],
-    });
-
-    const result = asRun(await run(registry));
-    expect(result.ok).toBe(false);
-    expect(result.steps[0]!.status).toBe("fail");
-    expect(result.steps[0]!.reason).toMatch(/clear left .* non-empty/);
-    expect(result.steps[0]!.reason).toContain("old@example.com");
-
-    // The text must NOT be typed after a failed clear: that is exactly the
-    // append this feature exists to prevent, and it would fail later at an
-    // assert pointing at the wrong step.
-    const keyboard = keyboardArgs(calls);
-    expect(keyboard).toEqual([{ clear: true }]);
-  });
-
-  it("passes when the emptied field reports only its placeholder", async () => {
-    const calls: Call[] = [];
-    // An empty Android field reports NO `text` attribute, while its hint still
-    // surfaces as the node's label ("Username or email address"). Reading the
-    // label as content would fail every successful clear — observed on a real
-    // device before the check was narrowed to `value`.
-    const registry = mockRegistry(calls, () => ({
-      xml: `<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
-<hierarchy rotation="0">
-  <node index="0" class="android.widget.FrameLayout" package="com.acme.app" bounds="[0,0][1080,1920]">
-    <node index="0" class="android.widget.EditText" resource-id="email" content-desc="Username or email address" focused="true" package="com.acme.app" bounds="[40,200][1040,280]" />
-  </node>
-</hierarchy>`,
-    }));
-
-    await writeFlow("f", {
-      executionPrerequisite: "",
-      steps: [{ kind: "type", into: { identifier: "email" }, text: "x", clear: true }],
-    });
-
-    const result = asRun(await run(registry));
-    expect(result.steps.map((s) => s.status)).toEqual(["pass"]);
-    expect(keyboardArgs(calls)).toEqual([{ clear: true }, { text: "x" }, { key: "enter" }]);
-  });
-
-  it("skips the check on a password field instead of reading it as empty", async () => {
-    const calls: Call[] = [];
-    // uiautomator reports empty text for password nodes, so an unconditional
-    // check would be a false PASS there — worse than not checking. The node
-    // below carries a non-empty text to prove the skip is driven by the
-    // password flag, not by the field looking empty.
-    const registry = mockRegistry(calls, () => ({ xml: fieldXml("still-here", true) }));
-
-    await writeFlow("f", {
-      executionPrerequisite: "",
-      steps: [{ kind: "type", into: { identifier: "email" }, text: "hunter2", clear: true }],
-    });
-
-    const result = asRun(await run(registry));
-    expect(result.steps.map((s) => s.status)).toEqual(["pass"]);
-    const keyboard = keyboardArgs(calls);
-    expect(keyboard).toEqual([{ clear: true }, { text: "hunter2" }, { key: "enter" }]);
-  });
-
-  it("does not read the tree back at all when the step has no clear", async () => {
+  it("reads the tree no more than a plain type step does", async () => {
+    // The clear must not add a read-back pass. An earlier cut verified the
+    // field was empty afterwards; that check was blind on iOS and on Chromium
+    // `<input>` (neither carries a `value`) and actively failed correct
+    // behaviour on Android fields whose hint becomes the value once emptied.
+    // Pin the absence so it is not reintroduced by reflex.
     let reads = 0;
     const calls: Call[] = [];
     const registry = mockRegistry(calls, () => {
@@ -246,7 +180,27 @@ describe("type directive — post-clear verification", () => {
     });
     asRun(await run(registry));
 
-    // The verification costs exactly one extra tree read, and only when asked.
-    expect(reads).toBe(withoutClear + 1);
+    expect(reads).toBe(withoutClear);
+  });
+});
+
+describe("type directive — report rendering", () => {
+  it("names the clear in the run report's step target", async () => {
+    // `into X` alone reads as a plain append, so a replace-a-field step would
+    // be indistinguishable in the report from the bug it fixes.
+    const calls: Call[] = [];
+    const registry = mockRegistry(calls, () => ({ xml: fieldXml("") }));
+
+    await writeFlow("f", {
+      executionPrerequisite: "",
+      steps: [
+        { kind: "type", into: { identifier: "email" }, text: "x", clear: true },
+        { kind: "type", into: { identifier: "email" }, text: "y" },
+      ],
+    });
+
+    const result = asRun(await run(registry));
+    expect(result.steps[0]!.target).toContain("cleared first");
+    expect(result.steps[1]!.target).not.toContain("cleared first");
   });
 });
