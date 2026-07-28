@@ -923,15 +923,51 @@ async function runRotate(
 }
 
 /**
- * Resolve `into` → tap to focus → wait for focus to land → type text via the
- * keyboard tool. Unless `submit` is explicitly `false`, a trailing Enter is
- * pressed to commit the value and dismiss the keyboard, so it can't obscure
- * later steps (chained form fields that end in an explicit submit `tap` should
- * pass `submit: false`).
+ * Read back the focused element's *entered value*, to confirm a `clear` actually
+ * emptied the field. Returns the remaining value, or undefined when the check
+ * cannot be trusted, in which case the caller must not fail the step.
+ *
+ * Only `value` counts. `label` / `subtreeText` carry the field's PLACEHOLDER
+ * (Android surfaces the hint as the node's label, so an emptied
+ * "Username or email address" box still reads that way), and treating those as
+ * content turns every successful clear into a step failure. An empty field
+ * reports no `value` at all rather than `""`, so "no value" is indistinguishable
+ * from "unreadable" — both mean "no evidence of leftover text", which is a pass.
+ *
+ * Also skipped for a password field: Android uiautomator reports empty text for
+ * `password="true"` nodes, so "looks empty" there would be a false pass rather
+ * than evidence.
+ */
+async function readFocusedValue(
+  env: ActionEnv,
+  into: FlowSelector,
+  tappedFrame: DescribeFrame
+): Promise<string | undefined> {
+  let tree: DescribeNode;
+  try {
+    ({ tree } = await fetchFlowTree(env.registry, env.device));
+  } catch {
+    return undefined;
+  }
+  const target = flowSelectorToFrame(tree, into) ?? tappedFrame;
+  const focused = collectFocused(tree, []).find((n) => framesOverlap(n.frame, target));
+  if (!focused || focused.password) return undefined;
+  return focused.value;
+}
+
+/**
+ * Resolve `into` → tap to focus → wait for focus to land → optionally clear the
+ * field → type text via the keyboard tool.
+ *
+ * `submit` presses a trailing Enter to commit the value and dismiss the
+ * keyboard, so it can't obscure later steps (chained form fields that end in an
+ * explicit submit `tap` should pass `submit: false`). It defaults to true when
+ * there is text, and to false for a clear-only step — Enter into a field the
+ * step just emptied is never the intent.
  */
 async function runType(
   env: ActionEnv,
-  step: { into: FlowSelector; text: string; submit?: boolean }
+  step: { into: FlowSelector; text?: string; clear?: boolean; submit?: boolean }
 ): Promise<DirectiveOutcome> {
   const frame = await waitForFrame(env, step.into);
   if (frame === "aborted") return ABORTED_OUTCOME;
@@ -950,8 +986,28 @@ async function runType(
   // its own), so a cancelled run can never type into, or submit, whatever the
   // app has focused after the caller gave up.
   if (env.signal?.aborted) return ABORTED_OUTCOME;
-  await invokeOnDevice(env, "keyboard", { text: step.text });
-  if (step.submit !== false) {
+  // Clear as its own call, before the text. `runType` is the one layer holding a
+  // settled tree, so it is also the only place that can cheaply confirm the
+  // clear landed — a flow that silently fails to clear reverts to appending and
+  // then fails at some later `assert`, pointing at the wrong step.
+  if (step.clear) {
+    await invokeOnDevice(env, "keyboard", { clear: true });
+    const remaining = await readFocusedValue(env, step.into, frame);
+    if (remaining !== undefined && remaining.trim() !== "") {
+      return {
+        ok: false,
+        reason:
+          `clear left ${describeSelector(step.into)} non-empty (still ${JSON.stringify(remaining)}) — ` +
+          `the field would have been appended to, not replaced`,
+      };
+    }
+  }
+  if (step.text !== undefined) {
+    if (env.signal?.aborted) return ABORTED_OUTCOME;
+    await invokeOnDevice(env, "keyboard", { text: step.text });
+  }
+  // Default: submit when there is text to commit, not on a clear-only step.
+  if (step.submit ?? step.text !== undefined) {
     if (env.signal?.aborted) return ABORTED_OUTCOME;
     // Enter goes in its own keyboard call because the tool rejects a combined
     // `{ text, key }` outright (see ../keyboard/index.ts) — two calls are the

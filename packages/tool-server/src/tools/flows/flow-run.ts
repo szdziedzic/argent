@@ -765,7 +765,11 @@ function stepTarget(step: FlowStep): string | undefined {
       if (step.x !== undefined && step.y !== undefined) return `(${step.x}, ${step.y})`;
       return undefined;
     case "type":
-      return `into ${selectorLabel(step.into)}`;
+      // Name the clear: "into X" reads as a plain append, so a run report of a
+      // replace-a-field step would look identical to the bug it fixes.
+      return step.clear
+        ? `into ${selectorLabel(step.into)} (cleared first)`
+        : `into ${selectorLabel(step.into)}`;
     case "await":
     case "assert":
       return conditionLabel(step, selectorLabel);

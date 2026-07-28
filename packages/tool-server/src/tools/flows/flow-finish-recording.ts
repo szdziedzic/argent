@@ -104,8 +104,13 @@ You can still edit the .yaml file directly afterwards to remove or reorder steps
         case "tap":
         case "long-press":
           return `${n}. ${step.kind}: ${step.selector ? selectorLabel(step.selector) : `(${step.x}, ${step.y})`}`;
-        case "type":
-          return `${n}. type: ${selectorLabel(step.into)} ← "${step.text}"`;
+        case "type": {
+          // `⇐` (replace) vs `←` (append) so a cleared field is visible at a
+          // glance; a clear-only step has nothing on the right-hand side.
+          const arrow = step.clear ? "⇐" : "←";
+          if (step.text === undefined) return `${n}. type: ${selectorLabel(step.into)} ⇐ (cleared)`;
+          return `${n}. type: ${selectorLabel(step.into)} ${arrow} "${step.text}"`;
+        }
         case "await":
         case "assert": {
           const tail =
