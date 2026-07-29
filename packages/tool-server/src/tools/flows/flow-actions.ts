@@ -104,6 +104,32 @@ export function invokeOnDevice(
   );
 }
 
+/**
+ * {@link invokeOnDevice} for a directive whose tool has no abort handling of its
+ * own. Cancelling a run tears down the transport the dispatch rides on (the
+ * simulator-server connection, the CDP session), so a call in flight when the
+ * caller gives up rejects with a raw backend message. Per {@link ABORTED_OUTCOME}
+ * that must read as an aborted skip, never a step failure quoting the tool —
+ * `runRotate` and `runLaunch` already apply this guard inline to their single
+ * dispatch; returning a boolean lets a multi-dispatch directive reuse it,
+ * matching {@link sleepOrAbort}'s shape.
+ *
+ * Returns false when the run was cancelled; a genuine tool error still throws.
+ */
+async function dispatchOrAbort(
+  env: ActionEnv,
+  tool: string,
+  args: Record<string, unknown>
+): Promise<boolean> {
+  try {
+    await invokeOnDevice(env, tool, args);
+  } catch (err) {
+    if (env.signal?.aborted) return false;
+    throw err;
+  }
+  return true;
+}
+
 const DEFAULT_ACTION_TIMEOUT_MS = 7500;
 const POLL_INTERVAL_MS = 300;
 
@@ -432,36 +458,60 @@ function collectFocused(node: DescribeNode, acc: DescribeNode[]): DescribeNode[]
 }
 
 /**
+ * Outcome of the focus handshake. The distinction only matters to a destructive
+ * `clear`: "unobservable" means this tree produced no focus evidence at all, so
+ * a failed poll says nothing, while "unconfirmed" means the tree DID report
+ * focus — just on something other than the target.
+ *
+ * Membership in {@link FOCUS_REPORTING_SOURCES} is not enough to tell those
+ * apart. An iOS device whose injected framework predates the `firstResponder`
+ * field answers `getFullHierarchy` without it (see `flow-ios-tree`), so the
+ * source is native-devtools yet no node is ever flagged — verified on an
+ * iPhone 16 Pro, where treating that as "unconfirmed" refused every clear on
+ * the platform. Hence the outcome keys off whether any node in the tree
+ * reported focus, not off the source alone.
+ */
+type FocusOutcome = "confirmed" | "unconfirmed" | "unobservable";
+
+/**
  * Poll until an element reporting `focused` overlaps the typed-into element.
  * Overlap, not identity: the selector often matches a testID container while
  * focus is reported by the input inside it. The target's frame is re-resolved
  * each round — the keyboard sliding up routinely scrolls the field away from
  * where it was tapped (keyboard avoidance), and the focused element must be
  * compared against where the field is NOW; `tappedFrame` covers rounds where
- * the selector momentarily doesn't resolve. Best-effort by design — a source
- * that can't report focus returns immediately, and an unconfirmed poll falls
- * through to typing after the timeout rather than failing the step, since "no
- * focus seen" can also mean the focused view didn't make it into the tree.
+ * the selector momentarily doesn't resolve.
+ *
+ * Reports rather than decides: plain typing treats "unconfirmed" as
+ * best-effort and types anyway (no focus seen can also mean the focused view
+ * didn't make it into the tree, and misplaced text is visible and additive),
+ * while `runType` refuses to dispatch a destructive clear on it.
  */
 async function waitForFocus(
   env: ActionEnv,
   into: FlowSelector,
   tappedFrame: DescribeFrame
-): Promise<void> {
+): Promise<FocusOutcome> {
   const deadline = Date.now() + TYPE_FOCUS_TIMEOUT_MS;
+  // Whether ANY node, in any round, reported focus. Distinguishes "focus is
+  // elsewhere" from "this tree cannot see focus" once the poll runs out.
+  let sawAnyFocus = false;
+  const giveUp = (): FocusOutcome => (sawAnyFocus ? "unconfirmed" : "unobservable");
   for (;;) {
-    if (env.signal?.aborted) return;
+    if (env.signal?.aborted) return giveUp();
     try {
       const { tree, source } = await fetchFlowTree(env.registry, env.device);
-      if (!FOCUS_REPORTING_SOURCES.has(source)) return;
+      if (!FOCUS_REPORTING_SOURCES.has(source)) return "unobservable";
       const target = flowSelectorToFrame(tree, into) ?? tappedFrame;
-      if (collectFocused(tree, []).some((n) => framesOverlap(n.frame, target))) return;
+      const focused = collectFocused(tree, []);
+      if (focused.length > 0) sawAnyFocus = true;
+      if (focused.some((n) => framesOverlap(n.frame, target))) return "confirmed";
     } catch {
       // transient describe failure — retry until the deadline
     }
-    if (Date.now() >= deadline) return;
+    if (Date.now() >= deadline) return giveUp();
     const sleepMs = Math.min(POLL_INTERVAL_MS, Math.max(0, deadline - Date.now()));
-    if (!(await sleepOrAbort(sleepMs, env.signal))) return;
+    if (!(await sleepOrAbort(sleepMs, env.signal))) return giveUp();
   }
 }
 
@@ -923,8 +973,8 @@ async function runRotate(
 }
 
 /**
- * Resolve `into` → tap to focus → wait for focus to land → optionally clear the
- * field → type text via the keyboard tool.
+ * Resolve `into` → tap to focus → wait for focus to land → clear and/or type
+ * text in one keyboard call → optionally press Enter in a second.
  *
  * `submit` presses a trailing Enter to commit the value and dismiss the
  * keyboard, so it can't obscure later steps (chained form fields that end in an
@@ -941,59 +991,89 @@ async function runType(
   if (!frame) {
     return { ok: false, reason: offscreenHint(step.into) };
   }
-  await invokeOnDevice(env, "gesture-tap", getDescribeTapPoint(frame));
+  if (!(await dispatchOrAbort(env, "gesture-tap", getDescribeTapPoint(frame)))) {
+    return ABORTED_OUTCOME;
+  }
   // Keys are injected at the HID level and go to whatever holds focus, so the
   // tap→type gap must cover the app's focus round-trip (see the constants).
   if (!(await sleepOrAbort(TYPE_FOCUS_SETTLE_MS, env.signal))) {
     return ABORTED_OUTCOME;
   }
-  await waitForFocus(env, step.into, frame);
-  // waitForFocus returns void on abort as well as on focus/timeout — re-check
-  // before every keyboard dispatch (the keyboard tool has no abort handling of
-  // its own), so a cancelled run can never type into, or submit, whatever the
-  // app has focused after the caller gave up.
+  const focus = await waitForFocus(env, step.into, frame);
+  // waitForFocus returns on abort as well as on focus/timeout — re-check before
+  // every keyboard dispatch (the keyboard tool has no abort handling of its
+  // own), so a cancelled run can never type into, or submit, whatever the app
+  // has focused after the caller gave up.
   if (env.signal?.aborted) return ABORTED_OUTCOME;
-  // Clear as its own call, before the text.
+  // Typing on an unconfirmed focus is best-effort — keys land in whatever holds
+  // focus, and misplaced text is additive and visible. A clear is neither, so it
+  // does not get to run blind: when the tree reported focus but never on the
+  // target, the tap did not move focus, and clearing then either wipes the field
+  // the run was previously in (unrecoverable, and reported as a pass on a field
+  // it never touched) or lands nowhere at all while the report still claims a
+  // clear. Both were reproduced on a Pixel 3a against a real app. "unobservable"
+  // — no focus evidence anywhere in the tree — is NOT that; it falls through to
+  // the same best-effort path as typing, which is what keeps `clear` working on
+  // an iOS build whose injected framework omits `firstResponder`.
   //
-  // Deliberately NOT followed by a read-back check that the field is now empty.
-  // The obvious one — re-read the focused node and fail if it still has text —
-  // cannot be made to work against the flow trees:
-  //
-  //   - iOS never carries a value at all (`flow-ios-tree` projects
-  //     {role, frame, children, label, identifier, focused} and does not even
-  //     request a text field), so the check is dead on the whole platform.
-  //   - A Chromium `<input>` likewise has no value: the DOM walker fills `value`
-  //     from the element's own child text nodes, and an input has none.
-  //   - On Android a field with no contentDescription puts its contents in
-  //     `label` (labelOf falls back to `text`), so again no value.
-  //
-  // …and where it DOES fire it is wrong as often as not: an emptied Android
-  // field with a contentDescription reports its HINT as the value (so a
-  // successful clear reads as leftover text), and a Chromium `<textarea>`
-  // exposes its default content once `el.value` goes empty. A check that is
-  // blind on the platforms that matter and fails correct behaviour on the rest
-  // is worse than none — the keyboard tool already rejects `clear` outright on
-  // every backend that cannot perform it, which is where the silent-no-op risk
-  // actually lives. Flows needing proof should assert the field's value, which
-  // is the flow language's own idiom and works everywhere.
-  if (step.clear) {
-    await invokeOnDevice(env, "keyboard", { clear: true });
+  // Known residual: an app that BLURS on an outside tap leaves nothing focused,
+  // which is indistinguishable from a tree that cannot report focus, so that
+  // clear still goes through as a no-op and the step still passes. Deliberate —
+  // the alternative refuses every clear on the iOS builds above (verified: it
+  // did), and a clear with nothing focused loses no data, where clearing the
+  // WRONG field does. Assert the result if a flow must prove the clear landed.
+  if (step.clear && focus === "unconfirmed") {
+    return {
+      ok: false,
+      reason:
+        `focus never reached ${describeSelector(step.into)} within ${TYPE_FOCUS_TIMEOUT_MS}ms — ` +
+        "refusing to clear, since the keys would empty whatever else holds focus. Check that the " +
+        "selector resolves to the input itself rather than to its label or a wrapper around it",
+    };
   }
-  if (step.text !== undefined) {
-    if (env.signal?.aborted) return ABORTED_OUTCOME;
-    await invokeOnDevice(env, "keyboard", { text: step.text });
+  // Clear and text ride ONE keyboard call. Each backend validates the WHOLE
+  // request before touching the device precisely so a rejected call leaves no
+  // trace — `assertTypeableAndroidText`, and the per-character resolves in the
+  // chromium and simulator-server backends, all run ahead of the clear. Issuing
+  // them separately steps outside that guarantee: the clear commits, the text is
+  // then rejected, and the field is left EMPTY by a call that returned 400. On a
+  // Pixel 3a, `{ into: field, text: "José", clear: true }` destroyed the field's
+  // value as two calls, where the same arguments as one call left it intact.
+  //
+  // No read-back check follows the clear. Re-reading the focused node and
+  // failing if it still holds text cannot be made to work against the flow
+  // trees: on iOS a field's contents never reach them at all (`flow-ios-tree`
+  // projects {role, frame, children, label, identifier, focused}), and where the
+  // check CAN see something it misfires — an emptied Android field with a
+  // contentDescription reports its HINT, and a Chromium `<textarea>` exposes its
+  // default content once `el.value` empties. What each platform does expose is
+  // tabulated once in the `argent-create-flow` skill, beside the assert guidance
+  // that depends on it. The focus refusal above — plus the keyboard tool
+  // rejecting `clear` outright on backends that cannot perform it — is where
+  // that risk is actually handled.
+  if (step.clear || step.text !== undefined) {
+    const sent = await dispatchOrAbort(env, "keyboard", {
+      ...(step.clear ? { clear: true } : {}),
+      ...(step.text !== undefined ? { text: step.text } : {}),
+    });
+    if (!sent) return ABORTED_OUTCOME;
   }
   // Default: submit when there is text to commit, not on a clear-only step.
   if (step.submit ?? step.text !== undefined) {
     if (env.signal?.aborted) return ABORTED_OUTCOME;
-    // Enter goes in its own keyboard call because the tool rejects a combined
-    // `{ text, key }` outright (see ../keyboard/index.ts) — two calls are the
-    // only way to express "type, then submit". On an Android TV target this call
-    // is also the one that fails: `typeTv` rejects `key` unconditionally, so the
-    // text lands and the submit errors. (Android TV is the TV kind that reaches
-    // here at all — an Apple TV stops at the focus tap above, whose `gesture-tap`
-    // resolves simulator-server and rejects a tvOS UDID.)
-    await invokeOnDevice(env, "keyboard", { key: "enter" });
+    // Enter is the ONE part that stays a separate call — the split that the
+    // clear/text pair above deliberately does not make. The keyboard tool rejects
+    // a combined `{ text, key }` outright (see ../keyboard/index.ts), so two calls
+    // are the only way to express "type, then submit". That does not extend to
+    // `clear`, which the tool allows alongside `text` — which is what lets the
+    // clear ride the same call and stay atomic with the text it replaces. On an
+    // Android TV target this call is also the one that fails: `typeTv` rejects
+    // `key` unconditionally, so the text lands and the submit errors. (Android TV
+    // is the TV kind that reaches here at all — an Apple TV stops at the focus tap
+    // above, whose `gesture-tap` resolves simulator-server and rejects a tvOS UDID.)
+    if (!(await dispatchOrAbort(env, "keyboard", { key: "enter" }))) {
+      return ABORTED_OUTCOME;
+    }
   }
   return { ok: true };
 }

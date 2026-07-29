@@ -268,6 +268,82 @@ describe("run cancellation mid-directive", () => {
     expect(calls).not.toContain("keyboard");
   });
 
+  it("reports a type cancelled DURING the keyboard dispatch as a skip, not an error", async () => {
+    // The keyboard tool has no abort handling of its own, so the guards around
+    // it only cover the gaps between calls. Cancelling tears down the transport
+    // the keys ride on (simulator-server connection, CDP session) and the
+    // in-flight call rejects with the backend's own message — which must not
+    // surface as a step failure quoting the tool. Same guard `runRotate` and
+    // `runLaunch` already apply to their dispatches.
+    const controller = new AbortController();
+    currentFetch = () => ({
+      tree: screen([
+        n({
+          identifier: "email",
+          focused: true,
+          frame: { x: 0.1, y: 0.2, width: 0.8, height: 0.06 },
+        }),
+      ]),
+      source: "native-devtools",
+    });
+    const calls: string[] = [];
+    const registry = {
+      invokeTool: vi.fn(async (id: string) => {
+        calls.push(id);
+        if (id === "list-devices") return { devices: [] };
+        if (id === "keyboard") {
+          controller.abort();
+          throw new Error("simulator-server connection closed");
+        }
+        return { ok: true };
+      }),
+      getTool: vi.fn(() => ({ inputSchema: { properties: { udid: {} } } })),
+    } as unknown as Registry;
+
+    await writeFlow("cancelled-type-dispatch", {
+      executionPrerequisite: "",
+      steps: [{ kind: "type", into: { identifier: "email" }, text: "a@b.com" }],
+    });
+
+    const result = await run("cancelled-type-dispatch", registry, controller.signal);
+
+    expect(result.steps.map((s) => `${s.kind}:${s.status}`)).toEqual(["type:skip"]);
+    expect(result.steps[0].reason).toBe("run aborted");
+    expect(calls).toContain("keyboard");
+  });
+
+  it("erases nothing when a clear-only step is cancelled during the focus wait", async () => {
+    const controller = new AbortController();
+    // Same timing as the text case above, which the clear-only shape does not
+    // inherit: it carries no `text`, so it reaches the keyboard dispatch by a
+    // different branch. A leak here is worse than a stray character — the run
+    // is cancelled and the field is emptied anyway, which no report would show.
+    let reads = 0;
+    currentFetch = () => {
+      reads++;
+      if (reads >= 3) controller.abort();
+      return {
+        tree: screen([
+          n({ identifier: "email", frame: { x: 0.1, y: 0.2, width: 0.8, height: 0.06 } }),
+        ]),
+        source: "native-devtools",
+      };
+    };
+    const calls: string[] = [];
+
+    await writeFlow("cancelled-clear", {
+      executionPrerequisite: "",
+      steps: [{ kind: "type", into: { identifier: "email" }, clear: true }],
+    });
+
+    const result = await run("cancelled-clear", mockRegistry(calls), controller.signal);
+
+    expect(result.steps.map((s) => `${s.kind}:${s.status}`)).toEqual(["type:skip"]);
+    expect(result.steps[0].reason).toBe("run aborted");
+    expect(calls).toContain("gesture-tap");
+    expect(calls).not.toContain("keyboard");
+  });
+
   it("reports an await cancelled mid-poll as a skip with the uniform abort reason", async () => {
     const controller = new AbortController();
     let reads = 0;

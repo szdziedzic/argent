@@ -447,7 +447,9 @@ Steps run in order: \`launch\` starts an app from scratch (terminate + relaunch)
 ready; \`tool\` calls dispatch through the registry; \`tap\`/\`long-press\`/\`type\` resolve a selector to an
 element and act on it (\`tap: { on, times: 2 }\` double-taps; \`long-press: { on, duration }\` presses and
 holds; \`type: { into, text, clear, submit }\` types into a field — \`clear: true\` empties it first, since
-typing otherwise APPENDS, and \`text\` may be omitted for a clear-only step, which sends no Enter;
+typing otherwise leaves the old value in place, the new text landing at the caret the focusing tap
+set (spliced INTO the old value on Android, appended on iOS); \`text\` may be omitted for a
+clear-only step, which sends no Enter unless \`submit: true\`;
 \`tap\`/\`long-press\` alternatively take a raw normalized point — bare \`{ x, y }\` or \`on: { x, y }\`;
 any selector may scope its matches geometrically, the CSS combinators read off frames: \`within: <selector>\`
 (descendant — inside that container's frame), \`after: <selector>\` (CSS \`~\` — following it in reading
@@ -767,10 +769,15 @@ function stepTarget(step: FlowStep): string | undefined {
       if (step.x !== undefined && step.y !== undefined) return `(${step.x}, ${step.y})`;
       return undefined;
     case "type":
-      // Name the clear: "into X" reads as a plain append, so a run report of a
-      // replace-a-field step would look identical to the bug it fixes.
+      // Name the clear: "into X" alone reads as a plain append, so a run report
+      // of a replace-a-field step would look identical to the bug it fixes.
+      // Present tense, like every sibling's option echo ("(down)", "(scale 3)"):
+      // this column says what the step ASKED for, not what happened — `base` is
+      // stamped before the directive runs and rides every outcome, so a past
+      // tense would claim a clear on a step that failed, errored, was skipped,
+      // or was refused for never confirming focus on the target.
       return step.clear
-        ? `into ${selectorLabel(step.into)} (cleared first)`
+        ? `into ${selectorLabel(step.into)} (clear first)`
         : `into ${selectorLabel(step.into)}`;
     case "await":
     case "assert":
