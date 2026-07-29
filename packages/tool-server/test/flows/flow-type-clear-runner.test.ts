@@ -164,6 +164,37 @@ describe("type directive — clear dispatch", () => {
     expect(keyboardArgs(calls)).toEqual([]);
   });
 
+  it("judges focus by the latest read, not by any read that ever saw it", async () => {
+    // The blur race. An app that drops focus when the tap lands reports the
+    // PREVIOUS field as focused for however many poll rounds precede the blur.
+    // With a sticky "saw focus at any point" flag the verdict then depended on
+    // whether round 1 beat the blur — the same flow against the same app failing
+    // or passing between runs. The question the clear is about to act on is
+    // whether something else holds focus NOW.
+    const calls: Call[] = [];
+    let reads = 0;
+    const registry = mockRegistry(calls, () => {
+      reads++;
+      // The pre-tap settle reads plus the first focus poll still see the old
+      // field focused; everything after the blur sees nothing focused.
+      return { xml: reads <= 3 ? unfocusedXml() : noFocusXml() };
+    });
+
+    await writeFlow("f", {
+      executionPrerequisite: "",
+      steps: [
+        { kind: "type", into: { identifier: "email" }, text: "new@example.com", clear: true },
+      ],
+    });
+
+    const result = asRun(await run(registry));
+    expect(result.steps.map((s) => s.status)).toEqual(["pass"]);
+    expect(keyboardArgs(calls)).toEqual([
+      { clear: true, text: "new@example.com" },
+      { key: "enter" },
+    ]);
+  });
+
   it("still clears when the tree reports focus on no node at all", async () => {
     // The refusal keys off focus being reported SOMEWHERE ELSE, not off the poll
     // failing. A tree that never flags focus is not evidence the tap missed —

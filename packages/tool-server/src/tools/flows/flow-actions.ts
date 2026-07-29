@@ -463,9 +463,10 @@ function collectFocused(node: DescribeNode, acc: DescribeNode[]): DescribeNode[]
 
 /**
  * Outcome of the focus handshake. The distinction only matters to a destructive
- * `clear`: "unobservable" means this tree produced no focus evidence at all, so
- * a failed poll says nothing, while "unconfirmed" means the tree DID report
- * focus — just on something other than the target.
+ * `clear`: "unobservable" means no focus evidence was obtained — the source
+ * cannot report focus, nothing was flagged, or the tree could not be read at
+ * all — so a failed poll says nothing, while "unconfirmed" means the tree DID
+ * report focus, just on something other than the target.
  *
  * Membership in {@link FOCUS_REPORTING_SOURCES} is not enough to tell those
  * apart. An iOS device whose injected framework predates the `firstResponder`
@@ -497,10 +498,16 @@ async function waitForFocus(
   tappedFrame: DescribeFrame
 ): Promise<FocusOutcome> {
   const deadline = Date.now() + TYPE_FOCUS_TIMEOUT_MS;
-  // Whether ANY node, in any round, reported focus. Distinguishes "focus is
-  // elsewhere" from "this tree cannot see focus" once the poll runs out.
-  let sawAnyFocus = false;
-  const giveUp = (): FocusOutcome => (sawAnyFocus ? "unconfirmed" : "unobservable");
+  // Did the MOST RECENT successful read see focus on anything? Deliberately the
+  // latest look and not "any look, ever": the question the caller is about to
+  // act on is whether something else holds focus NOW, and a sticky flag answers
+  // it with history instead. It also made the verdict a race — an app that
+  // blurs on the focusing tap reports focus for however many rounds precede the
+  // blur, so the same flow against the same app failed or passed depending on
+  // whether round 1 beat the blur. `undefined` until a read succeeds, so a
+  // window in which every read throws stays "unobservable".
+  let lastReadSawFocus: boolean | undefined;
+  const giveUp = (): FocusOutcome => (lastReadSawFocus ? "unconfirmed" : "unobservable");
   for (;;) {
     if (env.signal?.aborted) return giveUp();
     try {
@@ -508,7 +515,18 @@ async function waitForFocus(
       if (!FOCUS_REPORTING_SOURCES.has(source)) return "unobservable";
       const target = flowSelectorToFrame(tree, into) ?? tappedFrame;
       const focused = collectFocused(tree, []);
-      if (focused.length > 0) sawAnyFocus = true;
+      lastReadSawFocus = focused.length > 0;
+      // Overlap, not containment either way: the focused input can sit inside a
+      // testID container the selector matched, or the selector can match a label
+      // inside the focused field. The cost is that a focus-flagged node large
+      // enough to cover the target confirms it by construction — a focused
+      // full-screen container (an Android host WebView, an iOS first-responder
+      // container, a Chromium `<div tabindex>` focus trap) reads as "confirmed"
+      // for every target on screen. On Chromium that is benign (one
+      // activeElement per document, so a focused container means no input holds
+      // focus and the clear no-ops); the destructive shape needs two focused
+      // nodes at once, which only the Android/iOS adapters can emit and which
+      // has not been observed on a real device.
       if (focused.some((n) => framesOverlap(n.frame, target))) return "confirmed";
     } catch {
       // transient describe failure — retry until the deadline
