@@ -105,8 +105,12 @@ You can still edit the .yaml file directly afterwards to remove or reorder steps
         case "long-press":
           return `${n}. ${step.kind}: ${step.selector ? selectorLabel(step.selector) : `(${step.x}, ${step.y})`}`;
         case "type": {
-          // `⇐` (replace) vs `←` (append) so a cleared field is visible at a
+          // `⇐` (replaces the value) vs `←` (types into whatever is already
+          // there — NOT necessarily appending; see the `type` notes in the
+          // argent-create-flow skill) so a cleared field is visible at a
           // glance; a clear-only step has nothing on the right-hand side.
+          // Past tense is accurate here, unlike the run report's `(clear
+          // first)`: every recorded step ran live as it was added.
           const arrow = step.clear ? "⇐" : "←";
           if (step.text === undefined) return `${n}. type: ${selectorLabel(step.into)} ⇐ (cleared)`;
           return `${n}. type: ${selectorLabel(step.into)} ${arrow} "${step.text}"`;
