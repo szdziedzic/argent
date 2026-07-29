@@ -110,9 +110,13 @@ export function invokeOnDevice(
  * simulator-server connection, the CDP session), so a call in flight when the
  * caller gives up rejects with a raw backend message. Per {@link ABORTED_OUTCOME}
  * that must read as an aborted skip, never a step failure quoting the tool —
- * `runRotate` and `runLaunch` already apply this guard inline to their single
- * dispatch; returning a boolean lets a multi-dispatch directive reuse it,
- * matching {@link sleepOrAbort}'s shape.
+ * `runRotate` applied this guard inline before there was a second directive
+ * needing it; returning a boolean lets both share one copy, matching
+ * {@link sleepOrAbort}'s shape.
+ *
+ * `runLaunch` handles the same case differently on purpose and is NOT a caller:
+ * it returns a `restart-app failed: …` outcome rather than rethrowing, so
+ * routing it through here would change its behaviour.
  *
  * Returns false when the run was cancelled; a genuine tool error still throws.
  */
@@ -951,24 +955,20 @@ async function runRotate(
   }
 
   if (env.signal?.aborted) return ABORTED_OUTCOME;
-  try {
-    await invokeOnDevice(env, "gesture-rotate", {
-      centerX: center.x,
-      centerY: center.y,
-      ...(aspect === undefined
-        ? { radius: selected.radiusX }
-        : { radiusX: selected.radiusX, radiusY: selected.radiusY }),
-      startAngle: selected.startAngle,
-      // endAngle > startAngle = clockwise in the tool, matching +by.
-      endAngle: selected.startAngle + step.by,
-      durationMs: deriveRotateDurationMs(step.by),
-    });
-  } catch (err) {
-    // The tool rejects when cancelled mid-gesture; per ABORTED_OUTCOME that must
-    // read as an aborted skip, never a step failure with the tool's message.
-    if (env.signal?.aborted) return ABORTED_OUTCOME;
-    throw err;
-  }
+  // The tool rejects when cancelled mid-gesture; per ABORTED_OUTCOME that must
+  // read as an aborted skip, never a step failure with the tool's message.
+  const rotated = await dispatchOrAbort(env, "gesture-rotate", {
+    centerX: center.x,
+    centerY: center.y,
+    ...(aspect === undefined
+      ? { radius: selected.radiusX }
+      : { radiusX: selected.radiusX, radiusY: selected.radiusY }),
+    startAngle: selected.startAngle,
+    // endAngle > startAngle = clockwise in the tool, matching +by.
+    endAngle: selected.startAngle + step.by,
+    durationMs: deriveRotateDurationMs(step.by),
+  });
+  if (!rotated) return ABORTED_OUTCOME;
   return { ok: true };
 }
 
@@ -991,9 +991,11 @@ async function runType(
   if (!frame) {
     return { ok: false, reason: offscreenHint(step.into) };
   }
-  if (!(await dispatchOrAbort(env, "gesture-tap", getDescribeTapPoint(frame)))) {
-    return ABORTED_OUTCOME;
-  }
+  // Bare, like every other directive's `gesture-tap` (runTap, runLongPress,
+  // scrollIncrement, runPinch): only the keyboard dispatches below need the
+  // abort reclassification, and wrapping this one alone would single out the
+  // focus tap for a guard its five siblings don't have.
+  await invokeOnDevice(env, "gesture-tap", getDescribeTapPoint(frame));
   // Keys are injected at the HID level and go to whatever holds focus, so the
   // tap→type gap must cover the app's focus round-trip (see the constants).
   if (!(await sleepOrAbort(TYPE_FOCUS_SETTLE_MS, env.signal))) {

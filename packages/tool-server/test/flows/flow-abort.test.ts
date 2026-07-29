@@ -312,12 +312,56 @@ describe("run cancellation mid-directive", () => {
     expect(calls).toContain("keyboard");
   });
 
+  it("propagates a keyboard rejection as a real error when the run is not aborted", async () => {
+    // The other half of the guard above: only a CANCELLED run may be reclassified
+    // as a skip. A backend rejecting on its own — un-typeable text, an unknown
+    // key, an unreachable transport — must still surface as a step error with
+    // the tool's reason, or every such failure would be silently reported as
+    // "run aborted". Mirrors flow-rotate's "propagates a dispatch rejection as a
+    // real error when the run is not aborted".
+    currentFetch = () => ({
+      tree: screen([
+        n({
+          identifier: "email",
+          focused: true,
+          frame: { x: 0.1, y: 0.2, width: 0.8, height: 0.06 },
+        }),
+      ]),
+      source: "native-devtools",
+    });
+    const registry = {
+      invokeTool: vi.fn(async (id: string) => {
+        if (id === "list-devices") return { devices: [] };
+        if (id === "keyboard") throw new Error("simulator-server unreachable");
+        return { ok: true };
+      }),
+      getTool: vi.fn(() => ({ inputSchema: { properties: { udid: {} } } })),
+    } as unknown as Registry;
+
+    await writeFlow("type-dispatch-error", {
+      executionPrerequisite: "",
+      steps: [{ kind: "type", into: { identifier: "email" }, text: "a@b.com" }],
+    });
+
+    const result = asRun(
+      await createRunFlowTool(registry).execute({}, {
+        name: "type-dispatch-error",
+        project_root: tmpDir,
+        device: DEVICE,
+      } as never)
+    );
+
+    expect(result.steps[0]).toMatchObject({ kind: "type", status: "error" });
+    expect(result.steps[0].reason).toMatch(/simulator-server unreachable/);
+  });
+
   it("erases nothing when a clear-only step is cancelled during the focus wait", async () => {
     const controller = new AbortController();
-    // Same timing as the text case above, which the clear-only shape does not
-    // inherit: it carries no `text`, so it reaches the keyboard dispatch by a
-    // different branch. A leak here is worse than a stray character — the run
-    // is cancelled and the field is emptied anyway, which no report would show.
+    // The clear-only shape shares the keyboard dispatch with the text case, so
+    // this does not pin a separate branch — it pins the SHAPE: a cancelled
+    // clear-only step must leave the field alone. A leak here is worse than a
+    // stray character, since the run is reported cancelled while the field was
+    // emptied anyway, which no report would show.
     let reads = 0;
     currentFetch = () => {
       reads++;
