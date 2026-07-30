@@ -29,7 +29,10 @@ vi.mock("../../src/tools/flows/flow-pixels", async (importOriginal) => {
 
 import { capturePixels } from "../../src/tools/flows/flow-pixels";
 import { runDirective, settleTree } from "../../src/tools/flows/flow-actions";
-import { FlowTreeSourceUnavailableError } from "../../src/tools/flows/flow-errors";
+import {
+  FlowTreeSettleTimeoutError,
+  FlowTreeSourceUnavailableError,
+} from "../../src/tools/flows/flow-errors";
 import { createRunFlowTool, type FlowRunResult } from "../../src/tools/flows/flow-run";
 import { serializeFlow, type FlowStep } from "../../src/tools/flows/flow-utils";
 import { runSnapshot } from "../../src/tools/flows/flow-visual";
@@ -139,7 +142,7 @@ describe("pixel settle backstop", () => {
     });
   });
 
-  it("bounds a never-resolving initial tree read by the hard settle deadline", async () => {
+  it("bounds a never-resolving initial tree read without fabricating a source outage", async () => {
     vi.useFakeTimers();
     currentTree = () => new Promise(() => {});
     const env = {
@@ -151,12 +154,139 @@ describe("pixel settle backstop", () => {
       mode: "tree-only",
       absoluteDeadline: Date.now() + 1_000,
     });
-    const rejected = expect(pending).rejects.toThrow(
-      /timed out reading the UI tree while settling/
-    );
+    const caught = pending.catch((err: unknown) => err);
     await vi.advanceTimersByTimeAsync(1_000);
 
-    await rejected;
+    const err = await caught;
+    expect(err).toBeInstanceOf(FlowTreeSettleTimeoutError);
+    expect(err).toMatchObject({ message: "timed out reading the UI tree while settling" });
+    expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
+  });
+
+  it("does not start another tree read after polling reaches its phase deadline", async () => {
+    vi.useFakeTimers();
+    const source = new Error("native devtools is unavailable (service down)");
+    let reads = 0;
+    currentTree = () => {
+      reads++;
+      if (reads === 1) {
+        return new Promise((_, reject) => {
+          setTimeout(() => reject(source), 2_900);
+        });
+      }
+      return new Promise(() => {});
+    };
+    const env = {
+      registry: mockRegistry([]),
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+    const startedAt = Date.now();
+
+    let rejectedAt = -1;
+    const caught = settleTree(env).catch((err: unknown) => {
+      rejectedAt = Date.now();
+      return err;
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    const err = await caught;
+
+    expect(err).toBeInstanceOf(FlowTreeSourceUnavailableError);
+    expect(reads).toBe(1);
+    expect(rejectedAt - startedAt).toBe(3_000);
+  });
+
+  it.each(["selector", "coordinates"] as const)(
+    "uses a successful tree read beyond the 5s combined cap for %s taps",
+    async (target) => {
+      vi.useFakeTimers();
+      const visible = screen([
+        n({ label: "Go", frame: { x: 0.4, y: 0.4, width: 0.2, height: 0.2 } }),
+      ]);
+      currentTree = () =>
+        new Promise((resolve) => {
+          setTimeout(() => resolve(visible), 6_000);
+        });
+      const calls: string[] = [];
+      const registry = mockRegistry(calls);
+      const env = {
+        registry,
+        device: { platform: "ios", id: DEVICE },
+      } as unknown as ActionEnv;
+
+      const pending = runDirective(
+        env,
+        target === "selector"
+          ? { kind: "tap", selector: { text: "Go", loose: true } }
+          : { kind: "tap", x: 0.3, y: 0.7 }
+      );
+      const resolved = expect(pending).resolves.toMatchObject({ ok: true });
+      await vi.advanceTimersByTimeAsync(6_500);
+
+      await resolved;
+      expect(registry.invokeTool).toHaveBeenCalledWith(
+        "gesture-tap",
+        expect.objectContaining(target === "selector" ? { x: 0.5, y: 0.5 } : { x: 0.3, y: 0.7 })
+      );
+      expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
+    }
+  );
+
+  it("reports a slow successful tree read as snapshot degradation, not an outage fallback", async () => {
+    vi.useFakeTimers();
+    const visible = screen([
+      n({ label: "Go", frame: { x: 0.4, y: 0.4, width: 0.2, height: 0.2 } }),
+    ]);
+    currentTree = () =>
+      new Promise((resolve) => {
+        setTimeout(() => resolve(visible), 3_500);
+      });
+    vi.mocked(capturePixels).mockResolvedValue(solid([255, 255, 255]));
+
+    const shotPath = path.join(tmpDir, "slow-tree-snapshot.png");
+    const png = Buffer.alloc(24);
+    png.writeUInt32BE(390, 16);
+    png.writeUInt32BE(844, 20);
+    await fs.writeFile(shotPath, png);
+    const registry = {
+      invokeTool: vi.fn(async (id: string) => {
+        if (id === "screenshot") {
+          return {
+            image: {
+              __argentArtifact: true,
+              id: "slow-tree-current",
+              hostPath: shotPath,
+              mimeType: "image/png",
+            },
+          };
+        }
+        return { ok: true };
+      }),
+      getTool: vi.fn(() => ({ inputSchema: { properties: { udid: {} } } })),
+    } as unknown as Registry;
+    const env = {
+      registry,
+      ctx: { artifacts: new ArtifactStore() },
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+
+    const pending = runSnapshot(env, {
+      flowsDir: tmpDir,
+      flowName: "checkout",
+      name: "slow-tree",
+      maxMismatch: 0.5,
+      updateBaselines: true,
+    });
+    const resolved = expect(pending).resolves.toMatchObject({ status: "pass" });
+    await vi.advanceTimersByTimeAsync(4_000);
+    await resolved;
+    const result = await pending;
+
+    expect(result.reason).toBe(
+      "baseline written (slow-tree__ios-390x844.png); " +
+        "capture is best-effort/degraded because visual settling timed out"
+    );
+    // The successful late tree is observed; no fabricated outage sends the
+    // snapshot through its independent pixels-only fallback.
     expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
   });
 
@@ -714,6 +844,36 @@ describe("pixel settle backstop", () => {
     }
   );
 
+  it.each(["tap", "long-press"] as const)(
+    "dispatches a raw-coordinate %s at the deadline when the initial tree read hangs",
+    async (kind) => {
+      vi.useFakeTimers();
+      currentTree = () => new Promise<DescribeNode>(() => {});
+      const calls: string[] = [];
+      let dispatchedAt = -1;
+      const registry = mockRegistry(calls, undefined, (id) => {
+        if (id.startsWith("gesture-")) dispatchedAt = Date.now();
+      });
+      const env = {
+        registry,
+        device: { platform: "ios", id: DEVICE },
+      } as unknown as ActionEnv;
+      const startedAt = Date.now();
+
+      const pending = runDirective(
+        env,
+        kind === "tap" ? { kind, x: 0.3, y: 0.7 } : { kind, x: 0.3, y: 0.7, duration: 500 }
+      );
+      const resolved = expect(pending).resolves.toMatchObject({ ok: true });
+      await vi.advanceTimersByTimeAsync(7_500);
+      await resolved;
+
+      expect(dispatchedAt - startedAt).toBe(7_500);
+      expect(calls).toContain(kind === "tap" ? "gesture-tap" : "gesture-custom");
+      expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
+    }
+  );
+
   it("retries a raw-coordinate tap when revalidation misses once and a later settle succeeds", async () => {
     vi.useFakeTimers();
     const visible = screen([
@@ -963,6 +1123,44 @@ describe("pixel settle backstop", () => {
 
     expect(result.ok).toBe(true);
     expect(capturesAtSwipe).toEqual([2, 2]);
+    expect(vi.mocked(capturePixels)).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses a 3.5s successful tree read in a later tree-only scroll round", async () => {
+    vi.useFakeTimers();
+    const before = screen([
+      n({ label: "Before", frame: { x: 0.1, y: 0.1, width: 0.8, height: 0.1 } }),
+    ]);
+    const after = screen([
+      n({ label: "Target", frame: { x: 0.1, y: 0.5, width: 0.8, height: 0.2 } }),
+    ]);
+    let scrolled = false;
+    currentTree = () => {
+      if (!scrolled) return before;
+      return new Promise((resolve) => {
+        setTimeout(() => resolve(after), 3_500);
+      });
+    };
+    vi.mocked(capturePixels).mockResolvedValue(solid([255, 255, 255]));
+    const calls: string[] = [];
+    const registry = mockRegistry(calls, undefined, (id) => {
+      if (id === "gesture-swipe") scrolled = true;
+    });
+    const env = {
+      registry,
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+
+    const pending = runDirective(env, {
+      kind: "scroll-to",
+      target: { text: "Target" },
+      direction: "down",
+    });
+    const resolved = expect(pending).resolves.toMatchObject({ ok: true });
+    await vi.advanceTimersByTimeAsync(4_500);
+    await resolved;
+
+    expect(calls.filter((id) => id === "gesture-swipe")).toHaveLength(1);
     expect(vi.mocked(capturePixels)).toHaveBeenCalledTimes(2);
   });
 

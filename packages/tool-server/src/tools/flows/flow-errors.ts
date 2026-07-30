@@ -1,6 +1,5 @@
 /**
- * A bounded settle window ended without a single successful read from the
- * flow's full-hierarchy tree source.
+ * Every flow-tree read that completed in a bounded settle window failed.
  *
  * Snapshots may handle this one failure specially because they can establish
  * stability from pixels alone. Other settling failures must continue to
@@ -22,5 +21,20 @@ export class FlowTreeSourceUnavailableError extends Error {
       const descriptor = Object.getOwnPropertyDescriptor(source, key);
       if (descriptor) Object.defineProperty(this, key, descriptor);
     }
+  }
+}
+
+/**
+ * No flow-tree read completed before the settle's hard deadline.
+ *
+ * This is deliberately distinct from {@link FlowTreeSourceUnavailableError}:
+ * an in-flight native hierarchy read may still succeed after our caller stops
+ * waiting, so snapshots must report degraded settling rather than treating the
+ * source as proven down and silently substituting a pixels-only settle.
+ */
+export class FlowTreeSettleTimeoutError extends Error {
+  constructor() {
+    super("timed out reading the UI tree while settling");
+    this.name = "FlowTreeSettleTimeoutError";
   }
 }

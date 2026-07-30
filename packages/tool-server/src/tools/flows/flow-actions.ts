@@ -22,7 +22,7 @@ import {
 import { settleWithin, sleepOrAbort } from "../../utils/timing";
 import { invokeSubTool } from "../../utils/sub-invoke";
 import { bindDeviceArgs } from "./flow-device";
-import { FlowTreeSourceUnavailableError } from "./flow-errors";
+import { FlowTreeSettleTimeoutError, FlowTreeSourceUnavailableError } from "./flow-errors";
 import { fetchFlowTree } from "./flow-tree";
 import {
   capturePixels,
@@ -157,6 +157,11 @@ const PIXEL_SETTLE_TIMEOUT_MS = 2000;
 // opportunity to prove that the pre-capture selector coordinates are current.
 const FINAL_TREE_REVALIDATE_RESERVE_MS = SETTLE_POLL_MS;
 const COMBINED_SETTLE_TIMEOUT_MS = SETTLE_TIMEOUT_MS + PIXEL_SETTLE_TIMEOUT_MS;
+// A tree read already in flight may outlive the tree polling window: Android's
+// full hierarchy commonly takes longer than 3s under load. When no caller
+// supplies a wider hard deadline, still bound that one native read by the
+// longest built-in settle budget.
+const DEFAULT_TREE_READ_TIMEOUT_MS = COMBINED_SETTLE_TIMEOUT_MS;
 
 // `scroll-to`: a bounded number of momentum-free increments. Each travels half
 // the clip window along the scroll axis (half the screen when no `within`
@@ -361,7 +366,11 @@ export type SettleMode = "combined" | "tree-only";
 export interface SettleOptions {
   /** Combined tree + pixel stabilization by default; tree-only skips captures. */
   mode?: SettleMode;
-  /** Optional caller deadline, further bounded by the selected settle mode. */
+  /**
+   * Optional hard caller deadline. Phase windows still bound tree polling and
+   * pixel comparison, but an already-started tree read may use this full
+   * budget.
+   */
   absoluteDeadline?: number;
 }
 
@@ -372,10 +381,14 @@ type TreeReadResult =
   | { type: "deadline" }
   | { type: "aborted" };
 
-function treeSourceOutage(lastError?: Error): FlowTreeSourceUnavailableError {
-  return new FlowTreeSourceUnavailableError(
-    lastError ?? new Error("timed out reading the UI tree while settling")
-  );
+function noSuccessfulTreeRead(lastError?: Error): Error {
+  // Only a completed source failure proves an outage. A read that merely
+  // outlived our hard deadline may still succeed, so keep that as an ordinary
+  // settle timeout instead of routing snapshots into their pixels-only outage
+  // fallback.
+  return lastError
+    ? new FlowTreeSourceUnavailableError(lastError)
+    : new FlowTreeSettleTimeoutError();
 }
 
 /** Run one tree read inside the same hard boundary as the rest of settling. */
@@ -454,10 +467,19 @@ export async function settleTree(
 ): Promise<SettleResult | undefined> {
   const mode = options.mode ?? "combined";
   const settleTimeout = mode === "combined" ? COMBINED_SETTLE_TIMEOUT_MS : SETTLE_TIMEOUT_MS;
-  const deadline = Math.min(
+  const startedAt = Date.now();
+  // Tree/pixel polling retains its per-settle budget so a caller can retry a
+  // stale result while its wider action window remains.
+  const phaseDeadline = Math.min(
     options.absoluteDeadline ?? Number.POSITIVE_INFINITY,
-    Date.now() + settleTimeout
+    startedAt + settleTimeout
   );
+  // The source operation has a distinct hard boundary. Do not silently shorten
+  // a caller-owned action budget to the internal 5s combined window, or a
+  // healthy 5–7.5s native hierarchy read becomes an early action failure. With
+  // no caller deadline, allow a tree-only read to finish slightly after its 3s
+  // polling phase while keeping the unowned settle bounded.
+  const treeReadDeadline = options.absoluteDeadline ?? startedAt + DEFAULT_TREE_READ_TIMEOUT_MS;
   let seedFp: string | undefined;
   let lastTree: DescribeNode | undefined;
   let lastError: Error | undefined;
@@ -476,21 +498,35 @@ export async function settleTree(
   let visual: SettleResult["visual"] = "skipped";
 
   for (;;) {
-    const treeDeadline = Math.min(deadline, Date.now() + SETTLE_TIMEOUT_MS);
+    const treeDeadline = Math.min(phaseDeadline, Date.now() + SETTLE_TIMEOUT_MS);
     let prevFp = seedFp;
     let stableTree: DescribeNode | undefined;
     let stableFp: string | undefined;
+    let attemptedTreeRead = false;
 
     // Tree phase: find two matching successful reads. A failed read stays a
     // transient gap, preserving the previous successful fingerprint exactly as
     // the original tree-only settle did.
     for (;;) {
       if (env.signal?.aborted) return undefined;
-      const reading = await fetchTreeBefore(env, treeDeadline);
+      // Always permit the phase's first read, even when the caller handed us a
+      // deadline equal to "now", so its no-read result retains the established
+      // timeout taxonomy. After an attempt, however, never start another poll
+      // once the phase deadline has elapsed (including a sleep landing on it).
+      if (attemptedTreeRead && Date.now() >= treeDeadline) {
+        if (lastTree === undefined) throw noSuccessfulTreeRead(lastError);
+        return { tree: lastTree, converged: false, treeFresh, visual };
+      }
+      attemptedTreeRead = true;
+      // The tree-phase deadline bounds polling for a matching pair, not the
+      // source operation itself. Let an in-flight read use its remaining hard
+      // budget: a healthy 3.5s Android hierarchy read must not be abandoned at
+      // the 3s settle window when a longer read budget is still available.
+      const reading = await fetchTreeBefore(env, treeReadDeadline);
       if (reading.type === "aborted") return undefined;
       if (reading.type === "deadline") {
         if (lastTree === undefined) {
-          throw treeSourceOutage(lastError);
+          throw noSuccessfulTreeRead(lastError);
         }
         return { tree: lastTree, converged: false, treeFresh, visual };
       }
@@ -508,7 +544,7 @@ export async function settleTree(
         prevFp = fp;
       }
       if (Date.now() >= treeDeadline) {
-        if (lastTree === undefined) throw treeSourceOutage(lastError);
+        if (lastTree === undefined) throw noSuccessfulTreeRead(lastError);
         return lastTree === undefined
           ? undefined
           : { tree: lastTree, converged: false, treeFresh, visual };
@@ -530,7 +566,7 @@ export async function settleTree(
     // the UI tree may have moved. Reserve a short slice of the hard outer
     // deadline so a hung capture cannot consume the only chance to revalidate.
     const pixelDeadline = Math.min(
-      deadline - FINAL_TREE_REVALIDATE_RESERVE_MS,
+      phaseDeadline - FINAL_TREE_REVALIDATE_RESERVE_MS,
       Date.now() + PIXEL_SETTLE_TIMEOUT_MS
     );
     let pixelsConverged = true;
@@ -581,7 +617,7 @@ export async function settleTree(
     // returned undefined and all timeout paths. If this read cannot complete,
     // retain the best-effort tree for diagnostics/snapshots but mark it unsafe
     // for any caller that would derive gesture coordinates from it.
-    const finalReading = await fetchTreeBefore(env, deadline);
+    const finalReading = await fetchTreeBefore(env, phaseDeadline);
     if (finalReading.type === "aborted") return undefined;
     if (finalReading.type === "deadline") {
       return { tree: lastTree ?? stableTree, converged: false, treeFresh: false, visual };
@@ -611,7 +647,7 @@ export async function settleTree(
     // phase and overwrites this; `unavailable` and the sticky timeout stay.
     if (visual === "settled") visual = "skipped";
 
-    if (Date.now() >= deadline) {
+    if (Date.now() >= phaseDeadline) {
       return { tree: lastTree ?? stableTree, converged: false, treeFresh, visual };
     }
   }
@@ -1000,7 +1036,17 @@ async function resolveTargetPoint(
       // A sleep can land exactly on the deadline, and a zero-budget settle
       // would misreport a healthy tree source as an outage.
       if (Date.now() >= deadline) break;
-      const settled = await settleTree(env, { absoluteDeadline: deadline });
+      let settled: SettleResult | undefined;
+      try {
+        settled = await settleTree(env, { absoluteDeadline: deadline });
+      } catch (err) {
+        // Literal coordinates do not consume the tree. If no hierarchy read
+        // completed before the action's hard deadline, settling exhausted its
+        // best-effort budget and the gesture may still dispatch. A completed
+        // source failure proves an outage and every other error remains fatal.
+        if (err instanceof FlowTreeSettleTimeoutError) break;
+        throw err;
+      }
       if (!settled) return { fail: ABORTED_OUTCOME };
       // A fresh tree proves the settle's view is current; settled pixels
       // prove the screen itself stopped (settleTree never leaks a pre-restart

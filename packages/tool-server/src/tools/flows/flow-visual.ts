@@ -13,7 +13,7 @@ import {
   POLL_INTERVAL_MS,
   type ActionEnv,
 } from "./flow-actions";
-import { FlowTreeSourceUnavailableError } from "./flow-errors";
+import { FlowTreeSettleTimeoutError, FlowTreeSourceUnavailableError } from "./flow-errors";
 import { settlePixels, type PixelSettleOutcome } from "./flow-pixels";
 import { describeSelector, type FlowSelector } from "./flow-utils";
 import { sleepOrAbort } from "../../utils/timing";
@@ -175,6 +175,15 @@ async function settleSnapshot(env: ActionEnv): Promise<SnapshotSettle> {
       if (Date.now() >= deadline) return { outcome: "settled", treeFresh: false };
     }
   } catch (err) {
+    if (err instanceof FlowTreeSettleTimeoutError) {
+      // A hard timeout does not prove the hierarchy source is down. Preserve
+      // any pixel stillness an earlier retry established; otherwise surface
+      // honest degradation instead of switching to the outage-only pixels
+      // fallback and potentially writing an apparently settled baseline.
+      return staleSettled
+        ? { outcome: "settled", treeFresh: false }
+        : { outcome: "timed-out", treeFresh: false };
+    }
     if (err instanceof FlowTreeSourceUnavailableError) {
       // A dark retry cannot un-prove the stillness an earlier settle
       // established — accept it rather than re-derive it from extra captures.
