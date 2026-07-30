@@ -7,11 +7,12 @@ import type { DescribeFrame } from "../describe/contract";
 import {
   settleTree,
   invokeOnDevice,
-  waitForFrame,
+  waitForFrameResult,
   offscreenHint,
   DEFAULT_ACTION_TIMEOUT_MS,
   POLL_INTERVAL_MS,
   type ActionEnv,
+  type SettleResult,
 } from "./flow-actions";
 import { FlowTreeSettleTimeoutError, FlowTreeSourceUnavailableError } from "./flow-errors";
 import { settlePixels, type PixelSettleOutcome } from "./flow-pixels";
@@ -116,13 +117,25 @@ type SnapshotSettleOutcome = Exclude<PixelSettleOutcome, "aborted"> | "aborted" 
 interface SnapshotSettle {
   outcome: SnapshotSettleOutcome;
   /**
-   * Whether the settle ended on a current tree. Nothing reads this yet:
-   * `cropOn` — the one option that resolves coordinates rather than pixels —
-   * takes `waitForFrame` instead of this settler, and that path demands
-   * freshness itself (which the pixels-only outage fallback, reading no tree,
-   * can never provide).
+   * Whether the settle ended on a current tree. `cropOn` gets this verdict
+   * paired with its resolved frame; the full-screen pixels-only outage
+   * fallback, which reads no tree, can never provide freshness.
    */
   treeFresh: boolean;
+}
+
+/** Map one combined settle into the degradation vocabulary snapshots expose. */
+function snapshotSettleFromResult(settled: SettleResult): SnapshotSettle {
+  if (settled.visual === "settled") {
+    return { outcome: "settled", treeFresh: settled.treeFresh };
+  }
+  if (settled.visual === "skipped" && settled.converged) {
+    return { outcome: "skipped", treeFresh: settled.treeFresh };
+  }
+  if (settled.visual === "unavailable" && settled.converged) {
+    return { outcome: "unavailable", treeFresh: settled.treeFresh };
+  }
+  return { outcome: "timed-out", treeFresh: settled.treeFresh };
 }
 
 /**
@@ -264,37 +277,34 @@ export async function runSnapshot(
     cropOn?: FlowSelector;
   }
 ): Promise<VisualOutcome> {
-  // Wait for the UI to settle (tree + pixels) so the capture is stable
-  // run-to-run, rather than guessing a fixed delay. Skipped under `cropOn`:
-  // that path resolves its frame through `waitForFrame`, which settles
-  // internally, so settling here would only pay for a second settle — and its
-  // stricter outage handling (below) must not be pre-empted by the best-effort
-  // pixel fallback `settleSnapshot` applies.
-  const settle: SnapshotSettle =
-    opts.cropOn === undefined ? await settleSnapshot(env) : { outcome: "settled", treeFresh: true };
-  if (settle.outcome === "aborted" || env.signal?.aborted) {
-    return { status: "skip", reason: "run aborted during snapshot settle" };
-  }
-  const degradation = degradedReason(settle.outcome);
-
-  // `cropOn`: resolve the crop element's frame BEFORE capturing, so the pixels
-  // captured are the state the frame was resolved from. `waitForFrame` settles
-  // internally (the plain settle above is skipped) and auto-waits like the
-  // directives, with their standard not-found reason. Unlike the best-effort
-  // settle, a tree-source outage propagates as a step error here: without a
-  // tree there is no frame, and degrading to a full-screen capture would
-  // "compare" the whole screen against a cropped baseline.
+  let settle: SnapshotSettle;
   let cropFrame: DescribeFrame | undefined;
-  if (opts.cropOn !== undefined) {
-    const frame = await waitForFrame(env, opts.cropOn);
-    if (frame === "aborted") {
+
+  if (opts.cropOn === undefined) {
+    // Full-screen snapshots settle directly because they consume no selector
+    // coordinates and can fall back to pixels alone on a proven tree outage.
+    settle = await settleSnapshot(env);
+    if (settle.outcome === "aborted" || env.signal?.aborted) {
+      return { status: "skip", reason: "run aborted during snapshot settle" };
+    }
+  } else {
+    // Resolve the crop frame BEFORE capturing, and retain the visual verdict
+    // from that exact settle. A second settle could observe another screen;
+    // discarding this verdict would make timed-out/unavailable crop captures
+    // look undegraded. Tree-source outages still propagate: without a tree
+    // there is no frame, and a full-screen fallback would compare the wrong
+    // pixels against the cropped baseline.
+    const resolved = await waitForFrameResult(env, opts.cropOn);
+    if (resolved.frame === "aborted") {
       return { status: "skip", reason: "run aborted while resolving cropOn" };
     }
-    if (frame === undefined) {
+    if (resolved.frame === undefined) {
       return { status: "fail", reason: offscreenHint(opts.cropOn) };
     }
-    cropFrame = frame;
+    cropFrame = resolved.frame;
+    settle = snapshotSettleFromResult(resolved.settle);
   }
+  const degradation = degradedReason(settle.outcome);
 
   const store = requireArtifacts(env.ctx);
 
@@ -350,9 +360,11 @@ export async function runSnapshot(
       if (cropped === null) {
         return {
           status: "fail",
-          reason:
+          reason: withDegradation(
             `cropOn matched ${describeSelector(opts.cropOn!)} but its on-screen region is ` +
-            `empty at this resolution — nothing was compared`,
+              `empty at this resolution — nothing was compared`,
+            degradation
+          ),
           snapshotKey,
           // No crop exists to show, so attach the full capture (already registered).
           artifacts: { current: shot.image },

@@ -10,8 +10,9 @@ import type { DiffPngFilesOptions } from "../../src/tools/screenshot-diff/screen
 import {
   settleTree,
   invokeOnDevice,
-  waitForFrame,
+  waitForFrameResult,
   type ActionEnv,
+  type SettleResult,
 } from "../../src/tools/flows/flow-actions";
 import { FlowTreeSourceUnavailableError } from "../../src/tools/flows/flow-errors";
 import { settlePixels } from "../../src/tools/flows/flow-pixels";
@@ -31,12 +32,18 @@ const h = vi.hoisted(() => ({
   diffTopMask: "" as "" | NonNullable<DiffPngFilesOptions["topMask"]>,
   /** Set by the differ mock: the normalizeSizes option it was passed. */
   diffNormalizeSizes: undefined as boolean | undefined,
-  /** What the waitForFrame mock resolves a cropOn selector to. */
+  /** What the waitForFrameResult mock resolves a cropOn selector to. */
   cropFrame: undefined as
     | undefined
     | "aborted"
     | { x: number; y: number; width: number; height: number },
-  /** When set, the waitForFrame mock rejects with this (a tree-source outage). */
+  cropSettle: {
+    tree: {} as never,
+    converged: true,
+    treeFresh: true,
+    visual: "settled",
+  } as SettleResult,
+  /** When set, the waitForFrameResult mock rejects with this (a tree-source outage). */
   cropFrameError: null as null | Error,
   dimensionMismatch: null as null | {
     expected: { width: number; height: number };
@@ -56,9 +63,11 @@ vi.mock("../../src/tools/flows/flow-actions", async (importOriginal) => ({
     visual: "settled",
   })),
   invokeOnDevice: vi.fn(async () => ({ image: { hostPath: h.shotPath } })),
-  waitForFrame: vi.fn(async () => {
+  waitForFrameResult: vi.fn(async () => {
     if (h.cropFrameError) throw h.cropFrameError;
-    return h.cropFrame;
+    return h.cropFrame === "aborted"
+      ? { frame: "aborted" as const }
+      : { frame: h.cropFrame, settle: h.cropSettle };
   }),
 }));
 
@@ -174,6 +183,12 @@ beforeEach(async () => {
   h.diffTopMask = "";
   h.diffNormalizeSizes = undefined;
   h.cropFrame = undefined;
+  h.cropSettle = {
+    tree: {} as never,
+    converged: true,
+    treeFresh: true,
+    visual: "settled",
+  };
   h.cropFrameError = null;
   h.dimensionMismatch = null;
   vi.mocked(settleTree)
@@ -748,12 +763,30 @@ describe("runSnapshot cropOn", () => {
     const r = await runSnapshot(env, opts({ updateBaselines: true, cropOn }));
 
     expect(r.status).toBe("pass");
-    expect(vi.mocked(waitForFrame)).toHaveBeenCalledWith(env, cropOn);
-    // waitForFrame settles internally — the plain settle must not run too.
+    expect(vi.mocked(waitForFrameResult)).toHaveBeenCalledWith(env, cropOn);
+    // waitForFrameResult settles internally — the plain settle must not run too.
     expect(vi.mocked(settleTree)).not.toHaveBeenCalled();
     // Key: the FULL capture's dimensions (device-class identity) plus the
     // selector hash (crop identity). Content: the crop.
     expect(r.snapshotKey).toBe(cropKey);
+    await expect(pngSize(cropBaselinePath())).resolves.toEqual({ w: 50, h: 50 });
+  });
+
+  it("marks a cropOn baseline write degraded when its frame settle timed out", async () => {
+    h.cropSettle = {
+      tree: {} as never,
+      converged: false,
+      treeFresh: true,
+      visual: "timed-out",
+    };
+
+    const r = await runSnapshot(env, opts({ updateBaselines: true, cropOn }));
+
+    expect(r.status).toBe("pass");
+    expect(r.reason).toBe(
+      `baseline written (${cropKey}.png); ` +
+        "capture is best-effort/degraded because visual settling timed out"
+    );
     await expect(pngSize(cropBaselinePath())).resolves.toEqual({ w: 50, h: 50 });
   });
 
@@ -774,6 +807,26 @@ describe("runSnapshot cropOn", () => {
     expect(h.diffNormalizeSizes).toBe(false);
     // …and the unregistered crop did not outlive the call.
     await expect(fs.access(path.dirname(h.diffCurrentPath))).rejects.toThrow();
+  });
+
+  it("marks a failing cropOn comparison degraded when visual settling was unavailable", async () => {
+    await fs.mkdir(path.dirname(cropBaselinePath()), { recursive: true });
+    await writeRealPng(cropBaselinePath(), 50, 50);
+    h.mismatchPercentage = 3.1;
+    h.cropSettle = {
+      tree: {} as never,
+      converged: true,
+      treeFresh: true,
+      visual: "unavailable",
+    };
+
+    const r = await runSnapshot(env, opts({ cropOn }));
+
+    expect(r.status).toBe("fail");
+    expect(r.reason).toContain("diff 3.10% > 0.5%");
+    expect(r.reason).toContain(
+      "capture is best-effort/degraded because visual settling was unavailable"
+    );
   });
 
   it("never masks a crop, even one overlapping the status-bar band", async () => {
@@ -891,6 +944,12 @@ describe("runSnapshot cropOn", () => {
 
   it("fails a sub-pixel crop region instead of writing an empty PNG", async () => {
     h.cropFrame = { x: 0.5, y: 0.5, width: 0.001, height: 0.001 };
+    h.cropSettle = {
+      tree: {} as never,
+      converged: false,
+      treeFresh: true,
+      visual: "timed-out",
+    };
     const preexistingCropDirs = new Set(
       (await fs.readdir(os.tmpdir())).filter((e) => e.startsWith("argent-flow-crop-"))
     );
@@ -898,7 +957,11 @@ describe("runSnapshot cropOn", () => {
     const r = await runSnapshot(env, opts({ cropOn }));
 
     expect(r.status).toBe("fail");
-    expect(r.reason).toContain("empty at this resolution");
+    expect(r.reason).toBe(
+      `cropOn matched text="Header" but its on-screen region is ` +
+        `empty at this resolution — nothing was compared; ` +
+        `capture is best-effort/degraded because visual settling timed out`
+    );
     // The key still names the failure for an exporter (CLI --output), and the
     // FULL capture is attached as `current` — no crop exists to show.
     expect(r.snapshotKey).toBe(cropKey);

@@ -29,7 +29,7 @@ vi.mock("../../src/tools/flows/flow-pixels", async (importOriginal) => {
 
 import { capturePixels } from "../../src/tools/flows/flow-pixels";
 import { FIRST_FRAME_WAIT_MS } from "../../src/utils/simulator-client";
-import { runDirective, settleTree } from "../../src/tools/flows/flow-actions";
+import { runDirective, settleTree, waitForFrameResult } from "../../src/tools/flows/flow-actions";
 import {
   FlowTreeSettleTimeoutError,
   FlowTreeSourceUnavailableError,
@@ -561,6 +561,28 @@ describe("pixel settle backstop", () => {
 
     expect(result.ok).toBe(true);
     expect(calls).toContain("gesture-tap");
+    expect(vi.mocked(capturePixels)).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns the visual verdict from the same settle that resolved a frame", async () => {
+    vi.mocked(capturePixels).mockResolvedValue(undefined);
+    const env = {
+      registry: mockRegistry([]),
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+
+    const resolved = await waitForFrameResult(env, { text: "Go", loose: true });
+
+    expect(resolved).toMatchObject({
+      frame: { x: 0.4, y: 0.4, width: 0.2, height: 0.2 },
+      settle: {
+        converged: true,
+        treeFresh: true,
+        visual: "unavailable",
+      },
+    });
+    // One unavailable capture belongs to the settle that yielded the frame;
+    // resolving metadata must not trigger a second settle/capture.
     expect(vi.mocked(capturePixels)).toHaveBeenCalledTimes(1);
   });
 

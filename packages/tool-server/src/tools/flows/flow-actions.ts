@@ -698,33 +698,57 @@ export async function settleTree(
  * settled tree — a window of merely slow settles must not read as "element
  * not found". A genuinely absent element still returns undefined.
  *
- * Exported for `snapshot: { cropOn }` (flow-visual.ts), which resolves the
- * crop element's frame with the same settle + auto-wait the directives get.
+ * {@link waitForFrameResult} exposes the settle that produced the frame for
+ * `snapshot: { cropOn }`; ordinary directive callers keep this frame-only API.
  */
 export async function waitForFrame(
   env: ActionEnv,
   selector: FlowSelector
 ): Promise<DescribeFrame | "aborted" | undefined> {
+  return (await waitForFrameResult(env, selector)).frame;
+}
+
+export type WaitForFrameResult =
+  | { frame: DescribeFrame; settle: SettleResult }
+  | { frame: undefined; settle?: SettleResult }
+  | { frame: "aborted" };
+
+/**
+ * Resolve a selector exactly like {@link waitForFrame}, retaining the settle
+ * that supplied its tree. Crop snapshots use the paired result so they can
+ * report visual degradation without settling a second time after the frame
+ * was chosen.
+ */
+export async function waitForFrameResult(
+  env: ActionEnv,
+  selector: FlowSelector
+): Promise<WaitForFrameResult> {
   const deadline = Date.now() + DEFAULT_ACTION_TIMEOUT_MS;
   let lastTree: DescribeNode | undefined;
+  let lastSettle: SettleResult | undefined;
   for (;;) {
-    if (env.signal?.aborted) return "aborted";
+    if (env.signal?.aborted) return { frame: "aborted" };
     if (Date.now() >= deadline) break;
     const settled = await settleTree(env, { absoluteDeadline: deadline });
-    if (settled) lastTree = settled.tree;
+    if (settled) {
+      lastTree = settled.tree;
+      lastSettle = settled;
+    }
     if (settled?.treeFresh) {
       const frame = flowSelectorToFrame(settled.tree, selector);
-      if (frame) return frame;
+      if (frame) return { frame, settle: settled };
     } else if (env.signal?.aborted) {
-      return "aborted"; // settleTree bailed on the abort, not on a blank read
+      return { frame: "aborted" }; // settleTree bailed on the abort, not on a blank read
     }
     if (Date.now() >= deadline) break;
     const sleepMs = Math.min(POLL_INTERVAL_MS, Math.max(0, deadline - Date.now()));
-    if (!(await sleepOrAbort(sleepMs, env.signal))) return "aborted";
+    if (!(await sleepOrAbort(sleepMs, env.signal))) return { frame: "aborted" };
   }
   // Best-effort last resort: stale coordinates beat failing a step whose
   // settles merely ran long.
-  return lastTree ? flowSelectorToFrame(lastTree, selector) : undefined;
+  if (!lastTree || !lastSettle) return { frame: undefined, settle: lastSettle };
+  const frame = flowSelectorToFrame(lastTree, selector);
+  return frame ? { frame, settle: lastSettle } : { frame: undefined, settle: lastSettle };
 }
 
 function framesOverlap(a: DescribeFrame, b: DescribeFrame): boolean {
