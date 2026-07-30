@@ -677,6 +677,45 @@ describe("pixel settle backstop", () => {
     expect(vi.mocked(capturePixels)).toHaveBeenCalledTimes(1);
   });
 
+  it("invalidates pre-pixel tree freshness until post-pixel revalidation succeeds", async () => {
+    vi.useFakeTimers();
+    const stable = screen([n({ label: "Go", frame: { x: 0.4, y: 0.4, width: 0.2, height: 0.2 } })]);
+    const revalidationFailure = new Error("transient post-pixel tree failure");
+    let reads = 0;
+    currentTree = () => {
+      reads++;
+      return reads <= 2 ? stable : Promise.reject(revalidationFailure);
+    };
+    // Cross the ordinary combined phase after the tree has converged, then
+    // soft-fail the pixel source. The mandatory final tree read still runs in
+    // its reserved hard-deadline slice and rejects immediately.
+    vi.mocked(capturePixels).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(() => resolve(undefined), 5_000);
+        })
+    );
+    const env = {
+      registry: mockRegistry([]),
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+
+    const pending = settleTree(env, { absoluteDeadline: Date.now() + 7_500 });
+    await vi.advanceTimersByTimeAsync(5_500);
+    const settled = await pending;
+
+    // The returned tree is the stable pre-pixel sample. It cannot supply
+    // selector coordinates after pixel work until a post-pixel read succeeds.
+    expect(settled).toEqual({
+      tree: stable,
+      converged: false,
+      treeFresh: false,
+      visual: "unavailable",
+    });
+    expect(reads).toBe(3);
+    expect(vi.mocked(capturePixels)).toHaveBeenCalledTimes(1);
+  });
+
   it("revalidates a moved tree when a later capture becomes unavailable", async () => {
     const before = screen([n({ label: "Go", frame: { x: 0.1, y: 0.1, width: 0.2, height: 0.2 } })]);
     const after = screen([n({ label: "Go", frame: { x: 0.6, y: 0.6, width: 0.2, height: 0.2 } })]);
