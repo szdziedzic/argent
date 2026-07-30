@@ -207,16 +207,19 @@ function rewriteSiblingFlowPath(
 /**
  * For a recorded `flow-execute` call, decide whether to record it as a
  * `run: <name>.yaml` directive — the sibling-relative path form the runner
- * resolves against the containing flow file's directory. Returns the path to
- * compose, or a warning explaining why the raw `flow-execute` step was kept.
+ * resolves against the canonical containing flow file's directory. Returns
+ * the path to compose, or a warning explaining why the raw `flow-execute`
+ * step was kept.
  *
  * `run:` composes any sibling flow — fragment or e2e — resolved beside the
- * recording's flow file (host-resolved composition, design §12). An e2e
- * target's `launch` simply runs inline. So we keep the raw step only when
- * the target can't be resolved as a sibling, or the recording is remote (the
- * host can't read the client's sibling files to validate). A `flow_path`
- * target reaches here as its sibling `name` or not at all — see
- * {@link rewriteSiblingFlowPath}.
+ * recording flow's REAL file (host-resolved composition, design §12): the
+ * runner anchors `run:` at the realpath'd containing-file dir, so a recording
+ * made through a symlink validates its sibling in the canonical directory,
+ * not beside the symlink's spelling. An e2e target's `launch` simply runs
+ * inline. So we keep the raw step only when the target can't be resolved as
+ * a sibling, or the recording is remote (the host can't read the client's
+ * sibling files to validate). A `flow_path` target reaches here as its
+ * sibling `name` or not at all — see {@link rewriteSiblingFlowPath}.
  */
 async function captureRunTarget(
   session: RecordingSession | null,
@@ -234,10 +237,18 @@ async function captureRunTarget(
   try {
     assertSafeFlowName(name);
     // Resolve against the recording's own flows dir (the running flow-execute
-    // may have mutated the active-project-root global), not getFlowsDir().
-    // Parsing validates the sibling exists and is a well-formed flow; a failure
-    // falls through to keeping the raw step.
-    const fragPath = path.join(path.dirname(session.filePath), `${name}.yaml`);
+    // may have mutated the active-project-root global), not getFlowsDir() —
+    // and against the recording's REAL file, because the runner resolves the
+    // recorded `run:` against the canonical containing-file directory
+    // (scopeFlowDir in flow-run.ts). When the recording is itself a symlink,
+    // a sibling beside the symlink's spelling would validate here yet fail at
+    // replay, so the anchor must match the runner's. A realpath failure lands
+    // in the catch below — raw step plus warning, which is the right recorder
+    // semantics: an anchor we cannot canonicalize is one we cannot promise
+    // will replay. Parsing validates the sibling exists and is a well-formed
+    // flow; a failure likewise falls through to keeping the raw step.
+    const realFlowPath = await fs.realpath(session.filePath);
+    const fragPath = path.join(path.dirname(realFlowPath), `${name}.yaml`);
     parseFlow(await fs.readFile(fragPath, "utf8"));
     return { flow: `${name}.yaml` };
   } catch (err) {
