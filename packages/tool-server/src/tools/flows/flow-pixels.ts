@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import { PNG } from "pngjs";
 import { simulatorServerRef, type SimulatorServerApi } from "../../blueprints/simulator-server";
 import { chromiumCdpRef, type ChromiumCdpApi } from "../../blueprints/chromium-cdp";
+import { getSimulatorRuntimeKind } from "../../utils/ios-devices";
 import { FIRST_FRAME_WAIT_MS, httpScreenshot } from "../../utils/simulator-client";
 import { settleWithin, sleepOrAbort } from "../../utils/timing";
 import type { ActionEnv } from "./flow-actions";
@@ -51,14 +52,41 @@ export interface PixelSettleOptions {
   absoluteDeadline?: number;
 }
 
+export type PixelCaptureSupport = "available" | "absent" | "unknown";
+
+// One flow environment reuses its DeviceInfo object across settling and the
+// eventual capture. Preserve single-flight while a probe is pending and retain
+// fixed available/absent verdicts. An unknown result is transient (simctl may
+// have failed or the simulator may not be visible yet), so evict it after all
+// callers already sharing that pending promise receive the result.
+let pixelCaptureSupportCache = new WeakMap<ActionEnv["device"], Promise<PixelCaptureSupport>>();
+
 /**
- * Whether the platform has a pixel-capture backend at all. Vega has none wired
- * here, and that absence is architectural — combined settles consult this to
- * skip the pixel phase outright rather than report every healthy Vega settle
- * as a degraded "unavailable".
+ * Resolve pixel support without conflating a failed runtime lookup with iOS.
+ * Confirmed tvOS and Vega are architectural absences; confirmed local iOS,
+ * ios-remote, Android (including TV), and Chromium are capture-capable.
  */
-export function hasPixelCapture(device: ActionEnv["device"]): boolean {
-  return device.platform !== "vega";
+export function getPixelCaptureSupport(device: ActionEnv["device"]): Promise<PixelCaptureSupport> {
+  if (device.platform === "vega") return Promise.resolve("absent");
+  if (device.platform !== "ios") return Promise.resolve("available");
+  const cached = pixelCaptureSupportCache.get(device);
+  if (cached) return cached;
+  const pending = getSimulatorRuntimeKind(device.id).then(
+    (kind) => (kind === "tv" ? "absent" : kind === "mobile" ? "available" : "unknown"),
+    () => "unknown" as const
+  );
+  pixelCaptureSupportCache.set(device, pending);
+  void pending.then((support) => {
+    if (support === "unknown" && pixelCaptureSupportCache.get(device) === pending) {
+      pixelCaptureSupportCache.delete(device);
+    }
+  });
+  return pending;
+}
+
+/** Test-only: isolate per-device capability verdicts. */
+export function __resetPixelCaptureSupportCacheForTesting(): void {
+  pixelCaptureSupportCache = new WeakMap();
 }
 
 /** Per-capture bound within the overall settle window. */
@@ -74,12 +102,12 @@ export function pixelCaptureTimeoutMs(device: ActionEnv["device"], firstCapture:
 /**
  * Capture one downscaled screenshot to a temp file. iOS and Android share the
  * simulator-server backend; Chromium uses CDP. Combined settles never reach
- * here for Vega ({@link hasPixelCapture}); the guard covers the pixels-only
+ * here for Vega ({@link getPixelCaptureSupport}); the guard covers the pixels-only
  * outage fallback snapshots take when the tree source is down, where
  * `unavailable` is the honest report — nothing gated that capture.
  */
 async function captureFile(env: ActionEnv): Promise<string | undefined> {
-  if (!hasPixelCapture(env.device)) return undefined;
+  if ((await getPixelCaptureSupport(env.device)) !== "available") return undefined;
   if (env.device.platform === "chromium") {
     const ref = chromiumCdpRef(env.device);
     const api = (await env.registry.resolveService(ref.urn, ref.options)) as ChromiumCdpApi;

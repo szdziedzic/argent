@@ -26,12 +26,13 @@ import { FlowTreeSettleTimeoutError, FlowTreeSourceUnavailableError } from "./fl
 import { fetchFlowTree } from "./flow-tree";
 import {
   capturePixels,
-  hasPixelCapture,
+  getPixelCaptureSupport,
   pixelCaptureTimeoutMs,
   PIXEL_CAPTURE_TIMEOUT_MS,
   PIXEL_SETTLE_POLL_MS,
   PIXEL_SETTLE_TIMEOUT_MS,
   pixelsDiffer,
+  type PixelCaptureSupport,
   type PixelSettleOutcome,
 } from "./flow-pixels";
 import {
@@ -358,7 +359,7 @@ export interface SettleResult {
   treeFresh: boolean;
   /**
    * Pixel phase outcome. `skipped` means no pixel phase ran: tree-only mode,
-   * a platform with no capture backend at all ({@link hasPixelCapture} — the
+   * a platform with no capture backend at all ({@link getPixelCaptureSupport} — the
    * only way a combined settle converges with `skipped`), or tree settling
    * exhausting its deadline before a combined settle could start (or re-run)
    * captures. `settled` always describes the screen as returned (a pre-restart
@@ -383,6 +384,7 @@ export interface SettleOptions {
 }
 
 type PixelCaptureResult = Awaited<ReturnType<typeof capturePixels>> | "deadline" | "aborted";
+type PixelCaptureSupportResult = PixelCaptureSupport | "deadline" | "aborted";
 type TreeReadResult =
   | { type: "tree"; tree: DescribeNode }
   | { type: "error"; error: Error }
@@ -448,6 +450,23 @@ async function capturePixelsBefore(
   return result.value;
 }
 
+/** Bound the native runtime-kind capability probe by the caller's hard budget. */
+async function pixelCaptureSupportBefore(
+  env: ActionEnv,
+  deadline: number
+): Promise<PixelCaptureSupportResult> {
+  if (env.signal?.aborted) return "aborted";
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return "deadline";
+  const result = await settleWithin(getPixelCaptureSupport(env.device), remaining, env.signal);
+  if (result.type === "aborted" || env.signal?.aborted) return "aborted";
+  if (result.type === "timeout") return "deadline";
+  // The support resolver normally converts lookup failures to `unknown`; keep
+  // that honest fallback if its implementation ever lets an error escape.
+  if (result.type === "error") return "unknown";
+  return result.value;
+}
+
 /**
  * The single auto-settle primitive for flow interactions and snapshots.
  *
@@ -457,7 +476,7 @@ async function capturePixelsBefore(
  * tree moved during the pixel wait, restart from it instead of handing a stale
  * frame to the caller. `tree-only` mode returns after the matching tree pair
  * and never attempts a pixel capture; a platform with no capture backend at
- * all ({@link hasPixelCapture}) settles the same way even in combined mode.
+ * all ({@link getPixelCaptureSupport}) settles the same way even in combined mode.
  *
  * Returns the fully stable tree (`converged: true`), the best-effort latest tree
  * when either phase exhausts its bounded budget (`converged: false`), or
@@ -573,7 +592,15 @@ export async function settleTree(
     // `visual` stays "skipped" — an architectural absence, not the
     // probed-and-failed "unavailable" — and no revalidation read is owed
     // because no pixel wait ran for the tree to move under.
-    if (mode === "tree-only" || pixelsUnavailable || !hasPixelCapture(env.device)) {
+    if (mode === "tree-only" || pixelsUnavailable) {
+      return { tree: stableTree, converged: !pixelsTimedOut, treeFresh: true, visual };
+    }
+    const pixelSupport = await pixelCaptureSupportBefore(env, hardDeadline);
+    if (pixelSupport === "aborted" || env.signal?.aborted) return undefined;
+    if (pixelSupport === "deadline") {
+      throw new Error("timed out determining pixel capture support while settling");
+    }
+    if (pixelSupport === "absent") {
       return { tree: stableTree, converged: !pixelsTimedOut, treeFresh: true, visual };
     }
 
@@ -587,11 +614,10 @@ export async function settleTree(
     );
     let pixelsConverged = true;
     treeFresh = false;
-    const firstPixels = await capturePixelsBefore(
-      env,
-      pixelDeadline,
-      pixelCaptureTimeoutMs(env.device, true)
-    );
+    const firstPixels =
+      pixelSupport === "unknown"
+        ? undefined
+        : await capturePixelsBefore(env, pixelDeadline, pixelCaptureTimeoutMs(env.device, true));
     if (firstPixels === "aborted") return undefined;
     if (firstPixels === "deadline") {
       pixelsConverged = false;
@@ -726,17 +752,37 @@ export async function waitForFrameResult(
   const deadline = Date.now() + DEFAULT_ACTION_TIMEOUT_MS;
   let lastTree: DescribeNode | undefined;
   let lastSettle: SettleResult | undefined;
+  // An unknown iOS runtime probe is intentionally evicted globally so a later
+  // action can recover when the simulator becomes visible. Within one selector
+  // wait, though, retrying that same capability on every round only burns the
+  // action budget and can turn a healthy terminal tree miss into a probe
+  // timeout. Once it degrades, keep this wait tree-only.
+  let pixelsUnavailableForWait = false;
   for (;;) {
     if (env.signal?.aborted) return { frame: "aborted" };
     if (Date.now() >= deadline) break;
-    const settled = await settleTree(env, { absoluteDeadline: deadline });
-    if (settled) {
-      lastTree = settled.tree;
-      lastSettle = settled;
+    const forceTreeOnly: boolean = pixelsUnavailableForWait;
+    const settled = await settleTree(env, {
+      absoluteDeadline: deadline,
+      ...(forceTreeOnly ? { mode: "tree-only" as const } : {}),
+    });
+    // A forced tree-only retry is still part of a wait whose visual channel
+    // was unavailable. Keep that verdict paired with any frame (and terminal
+    // miss) produced by the retry instead of reporting visual work as skipped.
+    const effectiveSettle: SettleResult | undefined =
+      settled && forceTreeOnly ? { ...settled, visual: "unavailable" } : settled;
+    if (effectiveSettle) {
+      lastTree = effectiveSettle.tree;
+      lastSettle = effectiveSettle;
+      // Only a completed tree settle establishes a healthy tree-only fallback.
+      // A failed post-pixel revalidation must retry the combined path so its
+      // unavailable verdict cannot conceal the preceding pixel timeout.
+      pixelsUnavailableForWait ||=
+        effectiveSettle.converged && effectiveSettle.visual === "unavailable";
     }
-    if (settled?.treeFresh) {
-      const frame = flowSelectorToFrame(settled.tree, selector);
-      if (frame) return { frame, settle: settled };
+    if (effectiveSettle?.treeFresh) {
+      const frame = flowSelectorToFrame(effectiveSettle.tree, selector);
+      if (frame) return { frame, settle: effectiveSettle };
     } else if (env.signal?.aborted) {
       return { frame: "aborted" }; // settleTree bailed on the abort, not on a blank read
     }

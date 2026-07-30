@@ -5,8 +5,10 @@ import * as path from "node:path";
 import { PNG } from "pngjs";
 import type { ActionEnv } from "../../src/tools/flows/flow-actions";
 import {
+  __resetPixelCaptureSupportCacheForTesting,
   capturePixels,
   FIRST_PIXEL_CAPTURE_TIMEOUT_MS,
+  getPixelCaptureSupport,
   PIXEL_CAPTURE_TIMEOUT_MS,
   PIXEL_SETTLE_POLL_MS,
   PIXEL_SETTLE_TIMEOUT_MS,
@@ -14,12 +16,21 @@ import {
   settlePixels,
   type PixelFrame,
 } from "../../src/tools/flows/flow-pixels";
+import { getSimulatorRuntimeKind } from "../../src/utils/ios-devices";
 import { FIRST_FRAME_WAIT_MS } from "../../src/utils/simulator-client";
 
+vi.mock("../../src/utils/ios-devices", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/utils/ios-devices")>()),
+  getSimulatorRuntimeKind: vi.fn(async () => "mobile"),
+}));
+
 let tmpDir: string;
+const mockGetSimulatorRuntimeKind = vi.mocked(getSimulatorRuntimeKind);
 
 beforeEach(async () => {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "flow-pixels-"));
+  __resetPixelCaptureSupportCacheForTesting();
+  mockGetSimulatorRuntimeKind.mockReset().mockResolvedValue("mobile");
 });
 
 afterEach(async () => {
@@ -107,6 +118,118 @@ describe("capturePixels", () => {
       expect(await capturePixels(env)).toBeUndefined();
     }
   );
+
+  it.each([
+    ["ios", "simulator"],
+    ["android", "emulator"],
+  ] as const)(
+    "captures and cleans up decodable pixels through the native %s backend",
+    async (platform, kind) => {
+      const file = path.join(tmpDir, `${platform}-native.png`);
+      const png = new PNG({ width: 2, height: 1 });
+      png.data.set([10, 20, 30, 255, 40, 50, 60, 255]);
+      await fs.writeFile(file, PNG.sync.write(png));
+      const screenshot = vi.fn(async () => ({ path: file, url: `file://${file}` }));
+      const device = { platform, kind, id: `${platform}-device` };
+      const resolveService = vi.fn(async () => ({
+        transport: { screenshot },
+      }));
+      const env = {
+        device,
+        registry: { resolveService },
+      } as unknown as ActionEnv;
+
+      const pixels = await capturePixels(env);
+
+      expect(pixels).toMatchObject({ width: 2, height: 1 });
+      expect([...pixels!.data]).toEqual([10, 20, 30, 255, 40, 50, 60, 255]);
+      expect(resolveService).toHaveBeenCalledWith(`SimulatorServer:${device.id}`, { device });
+      expect(screenshot).toHaveBeenCalledWith({
+        rotation: undefined,
+        scale: 0.25,
+        signal: undefined,
+      });
+      await expect(fs.access(file)).rejects.toThrow();
+    }
+  );
+
+  it("classifies tvOS before service resolution and leaves Android TV capture-capable", async () => {
+    mockGetSimulatorRuntimeKind.mockResolvedValue("tv");
+    const resolveService = vi.fn(() => {
+      throw new Error("simulator-server must not be resolved for tvOS");
+    });
+    const tvOs = {
+      platform: "ios",
+      kind: "simulator",
+      id: "00000000-0000-0000-0000-0000000000TV",
+    } as const;
+
+    await expect(getPixelCaptureSupport(tvOs)).resolves.toBe("absent");
+    await expect(
+      capturePixels({ device: tvOs, registry: { resolveService } } as unknown as ActionEnv)
+    ).resolves.toBeUndefined();
+    expect(resolveService).not.toHaveBeenCalled();
+
+    mockGetSimulatorRuntimeKind.mockClear();
+    await expect(
+      getPixelCaptureSupport({ platform: "android", kind: "emulator", id: "android-tv" })
+    ).resolves.toBe("available");
+    expect(mockGetSimulatorRuntimeKind).not.toHaveBeenCalled();
+  });
+
+  it("evicts an unknown iOS verdict while keeping each failed capture honest", async () => {
+    mockGetSimulatorRuntimeKind.mockResolvedValue(undefined);
+    const device = {
+      platform: "ios",
+      kind: "simulator",
+      id: "00000000-0000-0000-0000-0000000000ab",
+    } as const;
+    const resolveService = vi.fn(() => {
+      throw new Error("unknown support must not be treated as available");
+    });
+    const env = { device, registry: { resolveService } } as unknown as ActionEnv;
+
+    await expect(capturePixels(env)).resolves.toBeUndefined();
+    await expect(capturePixels(env)).resolves.toBeUndefined();
+
+    expect(mockGetSimulatorRuntimeKind).toHaveBeenCalledTimes(2);
+    expect(resolveService).not.toHaveBeenCalled();
+  });
+
+  it("shares a pending unknown probe, then retries the same device and recovers to mobile", async () => {
+    let resolveFirst!: (kind: "mobile" | "tv" | undefined) => void;
+    const first = new Promise<"mobile" | "tv" | undefined>((resolve) => {
+      resolveFirst = resolve;
+    });
+    mockGetSimulatorRuntimeKind.mockImplementationOnce(() => first).mockResolvedValue("mobile");
+    const device = {
+      platform: "ios",
+      kind: "simulator",
+      id: "00000000-0000-0000-0000-0000000000ac",
+    } as const;
+
+    const pendingA = getPixelCaptureSupport(device);
+    const pendingB = getPixelCaptureSupport(device);
+    expect(mockGetSimulatorRuntimeKind).toHaveBeenCalledTimes(1);
+    resolveFirst(undefined);
+    await expect(Promise.all([pendingA, pendingB])).resolves.toEqual(["unknown", "unknown"]);
+
+    await expect(getPixelCaptureSupport(device)).resolves.toBe("available");
+    expect(mockGetSimulatorRuntimeKind).toHaveBeenCalledTimes(2);
+
+    const file = path.join(tmpDir, "recovered-mobile.png");
+    const png = new PNG({ width: 1, height: 1 });
+    png.data.set([10, 20, 30, 255]);
+    await fs.writeFile(file, PNG.sync.write(png));
+    const screenshot = vi.fn(async () => ({ path: file, url: `file://${file}` }));
+    const resolveService = vi.fn(async () => ({ transport: { screenshot } }));
+    const env = { device, registry: { resolveService } } as unknown as ActionEnv;
+
+    await expect(capturePixels(env)).resolves.toMatchObject({ width: 1, height: 1 });
+    expect(mockGetSimulatorRuntimeKind).toHaveBeenCalledTimes(2);
+    expect(resolveService).toHaveBeenCalledTimes(1);
+    await expect(fs.access(file)).rejects.toThrow();
+  });
 });
 
 describe("settlePixels", () => {

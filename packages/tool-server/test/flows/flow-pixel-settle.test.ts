@@ -27,7 +27,13 @@ vi.mock("../../src/tools/flows/flow-pixels", async (importOriginal) => {
   return { ...actual, capturePixels: vi.fn() };
 });
 
+vi.mock("../../src/utils/ios-devices", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/utils/ios-devices")>()),
+  getSimulatorRuntimeKind: vi.fn(async () => "mobile"),
+}));
+
 import { capturePixels } from "../../src/tools/flows/flow-pixels";
+import { getSimulatorRuntimeKind } from "../../src/utils/ios-devices";
 import { FIRST_FRAME_WAIT_MS } from "../../src/utils/simulator-client";
 import { runDirective, settleTree, waitForFrameResult } from "../../src/tools/flows/flow-actions";
 import {
@@ -40,6 +46,7 @@ import { runSnapshot } from "../../src/tools/flows/flow-visual";
 
 const DEVICE = "00000000-0000-0000-0000-0000000000ab"; // iOS UDID shape
 let tmpDir: string;
+const mockGetSimulatorRuntimeKind = vi.mocked(getSimulatorRuntimeKind);
 
 function n(partial: Partial<DescribeNode> & { frame: DescribeNode["frame"] }): DescribeNode {
   return { role: "AXOther", children: [], ...partial };
@@ -111,6 +118,7 @@ beforeEach(async () => {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "flow-pixel-settle-"));
   currentTree = () =>
     screen([n({ label: "Go", frame: { x: 0.4, y: 0.4, width: 0.2, height: 0.2 } })]);
+  mockGetSimulatorRuntimeKind.mockReset().mockResolvedValue("mobile");
   vi.mocked(capturePixels).mockReset();
   await writeFlow("tap-go");
 });
@@ -463,6 +471,193 @@ describe("pixel settle backstop", () => {
     expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
   });
 
+  it("settles combined mode tree-only on tvOS without probing simulator-server pixels", async () => {
+    mockGetSimulatorRuntimeKind.mockResolvedValue("tv");
+    const env = {
+      registry: mockRegistry([]),
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+
+    const settled = await settleTree(env);
+
+    expect(settled).toMatchObject({
+      converged: true,
+      treeFresh: true,
+      visual: "skipped",
+    });
+    expect(mockGetSimulatorRuntimeKind).toHaveBeenCalledWith(DEVICE);
+    expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
+  });
+
+  it("reports an unknown iOS runtime probe as pixel settling unavailable", async () => {
+    mockGetSimulatorRuntimeKind.mockResolvedValue(undefined);
+    const env = {
+      registry: mockRegistry([]),
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+
+    const settled = await settleTree(env);
+
+    expect(settled).toMatchObject({
+      converged: true,
+      treeFresh: true,
+      visual: "unavailable",
+    });
+    expect(mockGetSimulatorRuntimeKind).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
+  });
+
+  it("does not re-probe unknown pixel support within one selector wait", async () => {
+    vi.useFakeTimers();
+    mockGetSimulatorRuntimeKind.mockResolvedValueOnce(undefined).mockResolvedValue("mobile");
+    vi.mocked(capturePixels).mockResolvedValue(undefined);
+    currentTree = () => screen([]);
+    const env = {
+      registry: mockRegistry([]),
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+
+    const missing = waitForFrameResult(env, { text: "Go", loose: true });
+    await vi.advanceTimersByTimeAsync(7_500);
+
+    await expect(missing).resolves.toMatchObject({ frame: undefined });
+    expect(mockGetSimulatorRuntimeKind).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
+
+    currentTree = () =>
+      screen([n({ label: "Go", frame: { x: 0.4, y: 0.4, width: 0.2, height: 0.2 } })]);
+    const recovered = waitForFrameResult(env, { text: "Go", loose: true });
+    await vi.advanceTimersByTimeAsync(250);
+
+    await expect(recovered).resolves.toMatchObject({
+      frame: { x: 0.4, y: 0.4, width: 0.2, height: 0.2 },
+    });
+    expect(mockGetSimulatorRuntimeKind).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(capturePixels)).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps visual unavailability paired with a selector found by the forced tree-only round", async () => {
+    vi.useFakeTimers();
+    mockGetSimulatorRuntimeKind.mockResolvedValueOnce(undefined).mockResolvedValue("mobile");
+    const absent = screen([]);
+    const visible = screen([
+      n({ label: "Go", frame: { x: 0.4, y: 0.4, width: 0.2, height: 0.2 } }),
+    ]);
+    let reads = 0;
+    // The first combined settle consumes three reads: its stable pair and the
+    // mandatory post-probe revalidation. Reveal the selector only to the next,
+    // forced tree-only settle.
+    currentTree = () => (++reads <= 3 ? absent : visible);
+    const env = {
+      registry: mockRegistry([]),
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+
+    const pending = waitForFrameResult(env, { text: "Go", loose: true });
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await expect(pending).resolves.toMatchObject({
+      frame: { x: 0.4, y: 0.4, width: 0.2, height: 0.2 },
+      settle: {
+        converged: true,
+        treeFresh: true,
+        visual: "unavailable",
+      },
+    });
+    expect(mockGetSimulatorRuntimeKind).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
+  });
+
+  it("retries combined settling after a non-converged unavailable result", async () => {
+    vi.useFakeTimers();
+    const absent = screen([]);
+    const visible = screen([
+      n({ label: "Go", frame: { x: 0.4, y: 0.4, width: 0.2, height: 0.2 } }),
+    ]);
+    const revalidationFailure = new Error("transient post-pixel tree failure");
+    let reads = 0;
+    currentTree = () => {
+      reads++;
+      if (reads <= 2) return absent;
+      if (reads === 3) return Promise.reject(revalidationFailure);
+      return visible;
+    };
+    // The first unavailable capture crosses the combined phase and its final
+    // tree read fails, producing converged:false/treeFresh:false. The retry
+    // must remain combined and therefore perform the second capture.
+    vi.mocked(capturePixels)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            setTimeout(() => resolve(undefined), 5_000);
+          })
+      )
+      .mockResolvedValue(undefined);
+    const env = {
+      registry: mockRegistry([]),
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+
+    const pending = waitForFrameResult(env, { text: "Go", loose: true });
+    await vi.advanceTimersByTimeAsync(6_500);
+
+    await expect(pending).resolves.toMatchObject({
+      frame: { x: 0.4, y: 0.4, width: 0.2, height: 0.2 },
+      settle: {
+        converged: true,
+        treeFresh: true,
+        visual: "unavailable",
+      },
+    });
+    expect(vi.mocked(capturePixels)).toHaveBeenCalledTimes(2);
+  });
+
+  it("aborts while the iOS runtime-kind probe is pending without dispatching", async () => {
+    const controller = new AbortController();
+    mockGetSimulatorRuntimeKind.mockImplementation(() => new Promise(() => {}));
+    const calls: string[] = [];
+    const env = {
+      registry: mockRegistry(calls, controller.signal),
+      device: { platform: "ios", id: DEVICE },
+      signal: controller.signal,
+    } as unknown as ActionEnv;
+
+    const pending = runDirective(env, {
+      kind: "tap",
+      selector: { text: "Go", loose: true },
+    });
+    await vi.waitFor(() => expect(mockGetSimulatorRuntimeKind).toHaveBeenCalledTimes(1));
+    controller.abort();
+    const result = await pending;
+
+    expect(result).toEqual({ ok: false, aborted: true, reason: "run aborted" });
+    expect(calls).not.toContain("gesture-tap");
+    expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
+  });
+
+  it("bounds a pending iOS runtime-kind probe by the action deadline without dispatching", async () => {
+    vi.useFakeTimers();
+    mockGetSimulatorRuntimeKind.mockImplementation(() => new Promise(() => {}));
+    const calls: string[] = [];
+    const env = {
+      registry: mockRegistry(calls),
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+
+    const pending = runDirective(env, {
+      kind: "tap",
+      selector: { text: "Go", loose: true },
+    });
+    const rejected = expect(pending).rejects.toThrow(
+      "timed out determining pixel capture support while settling"
+    );
+    await vi.advanceTimersByTimeAsync(7_500);
+    await rejected;
+
+    expect(calls).not.toContain("gesture-tap");
+    expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
+  });
+
   it("writes an undegraded Vega snapshot baseline through the real combined settle", async () => {
     const shotPath = path.join(tmpDir, "snapshot.png");
     const png = Buffer.alloc(24);
@@ -504,6 +699,53 @@ describe("pixel settle backstop", () => {
     expect(result.status).toBe("pass");
     expect(result.reason).toBe("baseline written (home__vega-390x844.png)");
     expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
+  });
+
+  it("writes an undegraded tvOS snapshot baseline through the architectural pixel skip", async () => {
+    mockGetSimulatorRuntimeKind.mockResolvedValue("tv");
+    const shotPath = path.join(tmpDir, "tvos-snapshot.png");
+    const png = Buffer.alloc(24);
+    png.writeUInt32BE(1920, 16);
+    png.writeUInt32BE(1080, 20);
+    await fs.writeFile(shotPath, png);
+    const registry = {
+      invokeTool: vi.fn(async (id: string) => {
+        if (id === "screenshot") {
+          return {
+            image: {
+              __argentArtifact: true,
+              id: "tvos-current-snapshot",
+              hostPath: shotPath,
+              mimeType: "image/png",
+            },
+          };
+        }
+        return { ok: true };
+      }),
+      getTool: vi.fn(() => ({ inputSchema: { properties: { udid: {} } } })),
+    } as unknown as Registry;
+    const env = {
+      registry,
+      ctx: { artifacts: new ArtifactStore() },
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+
+    const result = await runSnapshot(env, {
+      flowsDir: tmpDir,
+      flowName: "checkout",
+      name: "tv-home",
+      maxMismatch: 0.5,
+      updateBaselines: true,
+    });
+
+    expect(result.status).toBe("pass");
+    expect(result.reason).toBe("baseline written (tv-home__ios-1920x1080.png)");
+    expect(result.reason).not.toContain("degraded");
+    expect(vi.mocked(capturePixels)).not.toHaveBeenCalled();
+    expect(registry.invokeTool).toHaveBeenCalledWith(
+      "screenshot",
+      expect.objectContaining({ includeImageInContext: false, scale: 1 })
+    );
   });
 
   it("still degrades a snapshot when a resolvable capture backend fails transiently", async () => {
