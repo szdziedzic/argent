@@ -6,10 +6,15 @@ import { PNG } from "pngjs";
 import type { ActionEnv } from "../../src/tools/flows/flow-actions";
 import {
   capturePixels,
+  FIRST_PIXEL_CAPTURE_TIMEOUT_MS,
+  PIXEL_CAPTURE_TIMEOUT_MS,
+  PIXEL_SETTLE_POLL_MS,
+  PIXEL_SETTLE_TIMEOUT_MS,
   pixelsDiffer,
   settlePixels,
   type PixelFrame,
 } from "../../src/tools/flows/flow-pixels";
+import { FIRST_FRAME_WAIT_MS } from "../../src/utils/simulator-client";
 
 let tmpDir: string;
 
@@ -118,6 +123,17 @@ describe("settlePixels", () => {
     } as unknown as ActionEnv;
   }
 
+  function simulatorEnv(captureScreenshot: () => Promise<{ path: string }>): ActionEnv {
+    return {
+      device: { platform: "ios", id: "00000000-0000-0000-0000-0000000000ab" },
+      registry: {
+        resolveService: vi.fn(async () => ({
+          transport: { screenshot: captureScreenshot },
+        })),
+      },
+    } as unknown as ActionEnv;
+  }
+
   function captureFactory(colors: Array<[number, number, number]>) {
     let index = 0;
     return async (): Promise<{ path: string }> => {
@@ -142,6 +158,48 @@ describe("settlePixels", () => {
     expect(captureScreenshot).toHaveBeenCalledTimes(2);
   });
 
+  it("shares a default window sized for first-frame and steady-state capture latency", () => {
+    expect(FIRST_PIXEL_CAPTURE_TIMEOUT_MS).toBeGreaterThan(FIRST_FRAME_WAIT_MS);
+    expect(PIXEL_CAPTURE_TIMEOUT_MS).toBe(2_000);
+    expect(PIXEL_SETTLE_POLL_MS).toBe(150);
+    expect(PIXEL_SETTLE_TIMEOUT_MS).toBe(
+      FIRST_PIXEL_CAPTURE_TIMEOUT_MS + PIXEL_SETTLE_POLL_MS + PIXEL_CAPTURE_TIMEOUT_MS
+    );
+  });
+
+  it("settles a first-frame-boundary capture plus completion overhead and a warm capture", async () => {
+    const files = [path.join(tmpDir, "slow-0.png"), path.join(tmpDir, "slow-1.png")];
+    for (const file of files) {
+      const png = new PNG({ width: 2, height: 2 });
+      png.data.fill(255);
+      await fs.writeFile(file, PNG.sync.write(png));
+    }
+    vi.useFakeTimers();
+    let index = 0;
+    const captureScreenshot = vi.fn(async () => {
+      const delay = index === 0 ? FIRST_FRAME_WAIT_MS + 250 : PIXEL_CAPTURE_TIMEOUT_MS - 100;
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+      return { path: files[index++]! };
+    });
+    const startedAt = Date.now();
+    const pending = settlePixels(simulatorEnv(captureScreenshot));
+    let settledAt: number | undefined;
+    const measured = pending.then((outcome) => {
+      settledAt = Date.now();
+      return outcome;
+    });
+
+    await vi.advanceTimersByTimeAsync(FIRST_FRAME_WAIT_MS + 250);
+    // Allow the real file read/decode/removal and observation gap to finish.
+    await vi.waitFor(() => expect(captureScreenshot).toHaveBeenCalledTimes(2));
+    await vi.advanceTimersByTimeAsync(PIXEL_CAPTURE_TIMEOUT_MS - 100);
+
+    await expect(measured).resolves.toBe("settled");
+    expect(settledAt! - startedAt).toBeLessThan(PIXEL_SETTLE_TIMEOUT_MS);
+    expect(captureScreenshot).toHaveBeenCalledTimes(2);
+    await expect(Promise.all(files.map((file) => fs.access(file)))).rejects.toThrow();
+  });
+
   it("reports unavailable when no pixel source exists", async () => {
     const env = {
       device: { platform: "vega", id: "vega-serial" },
@@ -162,6 +220,53 @@ describe("settlePixels", () => {
 
     await expect(pending).resolves.toBe("timed-out");
     expect(captureScreenshot).toHaveBeenCalledTimes(1);
+  });
+
+  it("expires a hung Chromium first capture at its per-capture timeout", async () => {
+    vi.useFakeTimers();
+    const captureScreenshot = vi.fn(() => new Promise<{ path: string }>(() => {}));
+    let outcome: Awaited<ReturnType<typeof settlePixels>> | undefined;
+    const pending = settlePixels(chromiumEnv(captureScreenshot)).then((value) => {
+      outcome = value;
+      return value;
+    });
+
+    await vi.advanceTimersByTimeAsync(PIXEL_CAPTURE_TIMEOUT_MS - 1);
+    expect(outcome).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+
+    await expect(pending).resolves.toBe("timed-out");
+    expect(captureScreenshot).toHaveBeenCalledTimes(1);
+  });
+
+  it("expires a hung subsequent capture at its own timeout", async () => {
+    vi.useFakeTimers();
+    const file = path.join(tmpDir, "first.png");
+    const png = new PNG({ width: 2, height: 2 });
+    png.data.fill(255);
+    await fs.writeFile(file, PNG.sync.write(png));
+    let calls = 0;
+    let outcome: Awaited<ReturnType<typeof settlePixels>> | undefined;
+    let settledAt = -1;
+    let secondStartedAt = -1;
+    const captureScreenshot = vi.fn(() => {
+      calls++;
+      if (calls === 1) return Promise.resolve({ path: file });
+      secondStartedAt = Date.now();
+      return new Promise<{ path: string }>(() => {});
+    });
+    const pending = settlePixels(chromiumEnv(captureScreenshot)).then((value) => {
+      outcome = value;
+      settledAt = Date.now();
+      return value;
+    });
+
+    await vi.waitFor(() => expect(captureScreenshot).toHaveBeenCalledTimes(2));
+    await vi.advanceTimersByTimeAsync(PIXEL_CAPTURE_TIMEOUT_MS);
+
+    await expect(pending).resolves.toBe("timed-out");
+    expect(outcome).toBe("timed-out");
+    expect(settledAt - secondStartedAt).toBe(PIXEL_CAPTURE_TIMEOUT_MS);
   });
 
   it("reports aborted without capturing when already cancelled", async () => {

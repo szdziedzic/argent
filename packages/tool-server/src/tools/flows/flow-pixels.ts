@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import { PNG } from "pngjs";
 import { simulatorServerRef, type SimulatorServerApi } from "../../blueprints/simulator-server";
 import { chromiumCdpRef, type ChromiumCdpApi } from "../../blueprints/chromium-cdp";
-import { httpScreenshot } from "../../utils/simulator-client";
+import { FIRST_FRAME_WAIT_MS, httpScreenshot } from "../../utils/simulator-client";
 import { settleWithin, sleepOrAbort } from "../../utils/timing";
 import type { ActionEnv } from "./flow-actions";
 
@@ -32,14 +32,22 @@ const PIXEL_THRESHOLD_SQUARED = PIXEL_THRESHOLD * PIXEL_THRESHOLD * MAX_RGB_DIST
 // transition.
 const MOTION_FRACTION = 0.002;
 
-const PIXEL_SETTLE_POLL_MS = 150;
-const PIXEL_SETTLE_TIMEOUT_MS = 2000;
+// `httpScreenshot` may spend its full first-frame wait before it even returns a
+// file path. Leave a separate completion margin for reading, decoding, and
+// removing that PNG. Warm captures retain their established two-second bound.
+const FIRST_CAPTURE_COMPLETION_MARGIN_MS = 500;
+export const FIRST_PIXEL_CAPTURE_TIMEOUT_MS =
+  FIRST_FRAME_WAIT_MS + FIRST_CAPTURE_COMPLETION_MARGIN_MS;
+export const PIXEL_CAPTURE_TIMEOUT_MS = 2_000;
+export const PIXEL_SETTLE_POLL_MS = 150;
+export const PIXEL_SETTLE_TIMEOUT_MS =
+  FIRST_PIXEL_CAPTURE_TIMEOUT_MS + PIXEL_SETTLE_POLL_MS + PIXEL_CAPTURE_TIMEOUT_MS;
 
 /** Result of a bounded pixel-only settle. */
 export type PixelSettleOutcome = "settled" | "timed-out" | "unavailable" | "aborted";
 
 export interface PixelSettleOptions {
-  /** Optional caller deadline, further bounded by the two-second pixel window. */
+  /** Optional caller deadline, further bounded by the shared default pixel window. */
   absoluteDeadline?: number;
 }
 
@@ -51,6 +59,16 @@ export interface PixelSettleOptions {
  */
 export function hasPixelCapture(device: ActionEnv["device"]): boolean {
   return device.platform !== "vega";
+}
+
+/** Per-capture bound within the overall settle window. */
+export function pixelCaptureTimeoutMs(device: ActionEnv["device"], firstCapture: boolean): number {
+  // Only simulator-server-backed platforms can spend FIRST_FRAME_WAIT_MS
+  // polling for their stream's first frame. Chromium is warm-bounded from its
+  // first CDP screenshot; Vega never reaches capture.
+  return firstCapture && device.platform !== "chromium"
+    ? FIRST_PIXEL_CAPTURE_TIMEOUT_MS
+    : PIXEL_CAPTURE_TIMEOUT_MS;
 }
 
 /**
@@ -96,9 +114,14 @@ export async function capturePixels(env: ActionEnv): Promise<PixelFrame | undefi
 
 type BoundedCapture = PixelFrame | "timed-out" | "aborted" | undefined;
 
-/** Wait for one capture without allowing a hung backend to escape `deadline`. */
-async function capturePixelsBefore(env: ActionEnv, deadline: number): Promise<BoundedCapture> {
+/** Wait for one capture within both its own and the overall settle deadline. */
+async function capturePixelsBefore(
+  env: ActionEnv,
+  overallDeadline: number,
+  timeoutMs: number
+): Promise<BoundedCapture> {
   if (env.signal?.aborted) return "aborted";
+  const deadline = Math.min(overallDeadline, Date.now() + timeoutMs);
   const remaining = deadline - Date.now();
   if (remaining <= 0) return "timed-out";
   const result = await settleWithin(capturePixels(env), remaining, env.signal);
@@ -127,7 +150,7 @@ export async function settlePixels(
     options.absoluteDeadline ?? Number.POSITIVE_INFINITY,
     Date.now() + PIXEL_SETTLE_TIMEOUT_MS
   );
-  const first = await capturePixelsBefore(env, deadline);
+  const first = await capturePixelsBefore(env, deadline, pixelCaptureTimeoutMs(env.device, true));
   if (first === "aborted" || first === "timed-out" || first === undefined) {
     return first === undefined ? "unavailable" : first;
   }
@@ -137,7 +160,7 @@ export async function settlePixels(
     const sleepMs = Math.min(PIXEL_SETTLE_POLL_MS, Math.max(0, deadline - Date.now()));
     if (sleepMs <= 0) return "timed-out";
     if (!(await sleepOrAbort(sleepMs, env.signal))) return "aborted";
-    const next = await capturePixelsBefore(env, deadline);
+    const next = await capturePixelsBefore(env, deadline, pixelCaptureTimeoutMs(env.device, false));
     if (next === "aborted" || next === "timed-out" || next === undefined) {
       return next === undefined ? "unavailable" : next;
     }

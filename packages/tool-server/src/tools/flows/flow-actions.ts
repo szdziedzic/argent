@@ -27,6 +27,10 @@ import { fetchFlowTree } from "./flow-tree";
 import {
   capturePixels,
   hasPixelCapture,
+  pixelCaptureTimeoutMs,
+  PIXEL_CAPTURE_TIMEOUT_MS,
+  PIXEL_SETTLE_POLL_MS,
+  PIXEL_SETTLE_TIMEOUT_MS,
   pixelsDiffer,
   type PixelSettleOutcome,
 } from "./flow-pixels";
@@ -146,22 +150,26 @@ const SETTLE_TIMEOUT_MS = 3000;
 // when the animation STARTS and animates only the presentation layer — which
 // keeps hit-testing — so a settled tree can still be covered by a dismissing
 // modal. Same blindness for Android window animations and Chromium opacity
-// fades. So once the tree converges, confirm the pixels stopped too. Bounded
-// so a perpetual animator adds at most this much per combined settle. A
-// `scroll-to` uses this only before its first increment; later checkpoints are
-// tree-only because each increment is already momentum-free/settled.
-const PIXEL_SETTLE_POLL_MS = 150;
-const PIXEL_SETTLE_TIMEOUT_MS = 2000;
+// fades. So once the tree converges, confirm the pixels stopped too. Captures,
+// their observation gap, and a perpetual animator share flow-pixels' bounded
+// window. A `scroll-to` uses this only before its first increment; later
+// checkpoints are tree-only because each increment is already
+// momentum-free/settled.
 // Leave one bounded tree-read window after the pixel phase. Without this
 // reserve a hung capture can consume the caller's entire deadline, leaving no
 // opportunity to prove that the pre-capture selector coordinates are current.
 const FINAL_TREE_REVALIDATE_RESERVE_MS = SETTLE_POLL_MS;
-const COMBINED_SETTLE_TIMEOUT_MS = SETTLE_TIMEOUT_MS + PIXEL_SETTLE_TIMEOUT_MS;
+// The ordinary phase stays short enough for action-level callers to retry a
+// stale final tree. A separate hard ceiling below lets a capture already in
+// progress use the full first-frame-aware pixel budget.
+const COMBINED_PHASE_TIMEOUT_MS = SETTLE_TIMEOUT_MS + PIXEL_CAPTURE_TIMEOUT_MS;
+const COMBINED_HARD_TIMEOUT_MS =
+  SETTLE_TIMEOUT_MS + PIXEL_SETTLE_TIMEOUT_MS + FINAL_TREE_REVALIDATE_RESERVE_MS;
 // A tree read already in flight may outlive the tree polling window: Android's
 // full hierarchy commonly takes longer than 3s under load. When no caller
 // supplies a wider hard deadline, still bound that one native read by the
 // longest built-in settle budget.
-const DEFAULT_TREE_READ_TIMEOUT_MS = COMBINED_SETTLE_TIMEOUT_MS;
+const DEFAULT_TREE_READ_TIMEOUT_MS = COMBINED_PHASE_TIMEOUT_MS;
 
 // `scroll-to`: a bounded number of momentum-free increments. Each travels half
 // the clip window along the scroll axis (half the screen when no `within`
@@ -422,8 +430,13 @@ async function fetchTreeBefore(env: ActionEnv, deadline: number): Promise<TreeRe
  * and deleting its temporary file when it eventually completes; settleWithin
  * also consumes a late rejection.
  */
-async function capturePixelsBefore(env: ActionEnv, deadline: number): Promise<PixelCaptureResult> {
+async function capturePixelsBefore(
+  env: ActionEnv,
+  overallDeadline: number,
+  timeoutMs: number
+): Promise<PixelCaptureResult> {
   if (env.signal?.aborted) return "aborted";
+  const deadline = Math.min(overallDeadline, Date.now() + timeoutMs);
   const remaining = deadline - Date.now();
   if (remaining <= 0) return "deadline";
   const result = await settleWithin(capturePixels(env), remaining, env.signal);
@@ -466,7 +479,7 @@ export async function settleTree(
   options: SettleOptions = {}
 ): Promise<SettleResult | undefined> {
   const mode = options.mode ?? "combined";
-  const settleTimeout = mode === "combined" ? COMBINED_SETTLE_TIMEOUT_MS : SETTLE_TIMEOUT_MS;
+  const settleTimeout = mode === "combined" ? COMBINED_PHASE_TIMEOUT_MS : SETTLE_TIMEOUT_MS;
   const startedAt = Date.now();
   // Tree/pixel polling retains its per-settle budget so a caller can retry a
   // stale result while its wider action window remains.
@@ -474,6 +487,9 @@ export async function settleTree(
     options.absoluteDeadline ?? Number.POSITIVE_INFINITY,
     startedAt + settleTimeout
   );
+  const hardDeadline =
+    options.absoluteDeadline ??
+    startedAt + (mode === "combined" ? COMBINED_HARD_TIMEOUT_MS : SETTLE_TIMEOUT_MS);
   // The source operation has a distinct hard boundary. Do not silently shorten
   // a caller-owned action budget to the internal 5s combined window, or a
   // healthy 5–7.5s native hierarchy read becomes an early action failure. With
@@ -566,12 +582,16 @@ export async function settleTree(
     // the UI tree may have moved. Reserve a short slice of the hard outer
     // deadline so a hung capture cannot consume the only chance to revalidate.
     const pixelDeadline = Math.min(
-      phaseDeadline - FINAL_TREE_REVALIDATE_RESERVE_MS,
+      hardDeadline - FINAL_TREE_REVALIDATE_RESERVE_MS,
       Date.now() + PIXEL_SETTLE_TIMEOUT_MS
     );
     let pixelsConverged = true;
     treeFresh = false;
-    const firstPixels = await capturePixelsBefore(env, pixelDeadline);
+    const firstPixels = await capturePixelsBefore(
+      env,
+      pixelDeadline,
+      pixelCaptureTimeoutMs(env.device, true)
+    );
     if (firstPixels === "aborted") return undefined;
     if (firstPixels === "deadline") {
       pixelsConverged = false;
@@ -591,7 +611,11 @@ export async function settleTree(
           break;
         }
         if (!(await sleepOrAbort(sleepMs, env.signal))) return undefined;
-        const nextPixels = await capturePixelsBefore(env, pixelDeadline);
+        const nextPixels = await capturePixelsBefore(
+          env,
+          pixelDeadline,
+          pixelCaptureTimeoutMs(env.device, false)
+        );
         if (nextPixels === "aborted") return undefined;
         if (nextPixels === "deadline") {
           pixelsConverged = false;
@@ -617,7 +641,14 @@ export async function settleTree(
     // returned undefined and all timeout paths. If this read cannot complete,
     // retain the best-effort tree for diagnostics/snapshots but mark it unsafe
     // for any caller that would derive gesture coordinates from it.
-    const finalReading = await fetchTreeBefore(env, phaseDeadline);
+    // Fast pixel phases retain the original phase deadline, giving callers a
+    // chance to retry a stale final tree. If a valid first-frame-aware capture
+    // crossed that phase, use only the explicitly reserved final-read slice.
+    const finalTreeDeadline =
+      Date.now() < phaseDeadline
+        ? phaseDeadline
+        : Math.min(hardDeadline, Date.now() + FINAL_TREE_REVALIDATE_RESERVE_MS);
+    const finalReading = await fetchTreeBefore(env, finalTreeDeadline);
     if (finalReading.type === "aborted") return undefined;
     if (finalReading.type === "deadline") {
       return { tree: lastTree ?? stableTree, converged: false, treeFresh: false, visual };

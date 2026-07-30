@@ -62,7 +62,8 @@ vi.mock("../../src/tools/flows/flow-actions", async (importOriginal) => ({
   }),
 }));
 
-vi.mock("../../src/tools/flows/flow-pixels", () => ({
+vi.mock("../../src/tools/flows/flow-pixels", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/tools/flows/flow-pixels")>()),
   settlePixels: vi.fn(async () => "settled"),
 }));
 
@@ -337,7 +338,9 @@ describe("runSnapshot settle", () => {
 
     expect(r.status).toBe("pass");
     expect(r.reason).not.toContain("degraded");
-    expect(vi.mocked(settlePixels)).toHaveBeenCalledWith(env);
+    expect(vi.mocked(settlePixels)).toHaveBeenCalledWith(env, {
+      absoluteDeadline: expect.any(Number),
+    });
     expect(vi.mocked(settlePixels).mock.invocationCallOrder[0]).toBeLessThan(
       vi.mocked(invokeOnDevice).mock.invocationCallOrder[0]!
     );

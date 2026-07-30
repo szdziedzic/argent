@@ -188,7 +188,10 @@ async function settleSnapshot(env: ActionEnv): Promise<SnapshotSettle> {
       // A dark retry cannot un-prove the stillness an earlier settle
       // established — accept it rather than re-derive it from extra captures.
       if (staleSettled) return { outcome: "settled", treeFresh: false };
-      return { outcome: await settlePixels(env), treeFresh: false };
+      return {
+        outcome: await settlePixels(env, { absoluteDeadline: deadline }),
+        treeFresh: false,
+      };
     }
     throw err;
   }

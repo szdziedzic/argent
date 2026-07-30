@@ -28,6 +28,7 @@ vi.mock("../../src/tools/flows/flow-pixels", async (importOriginal) => {
 });
 
 import { capturePixels } from "../../src/tools/flows/flow-pixels";
+import { FIRST_FRAME_WAIT_MS } from "../../src/utils/simulator-client";
 import { runDirective, settleTree } from "../../src/tools/flows/flow-actions";
 import {
   FlowTreeSettleTimeoutError,
@@ -365,6 +366,38 @@ describe("pixel settle backstop", () => {
     expect(vi.mocked(capturePixels)).toHaveBeenCalledTimes(3);
   });
 
+  it("settles a first-frame-boundary capture plus completion overhead inside the action deadline", async () => {
+    vi.useFakeTimers();
+    vi.mocked(capturePixels)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            setTimeout(() => resolve(solid([255, 255, 255])), FIRST_FRAME_WAIT_MS + 250);
+          })
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            setTimeout(() => resolve(solid([255, 255, 255])), 100);
+          })
+      );
+    const env = {
+      registry: mockRegistry([]),
+      device: { platform: "ios", id: DEVICE },
+    } as unknown as ActionEnv;
+
+    const pending = settleTree(env, { absoluteDeadline: Date.now() + 7_500 });
+    await vi.advanceTimersByTimeAsync(7_000);
+    const settled = await pending;
+
+    expect(settled).toMatchObject({
+      converged: true,
+      treeFresh: true,
+      visual: "settled",
+    });
+    expect(vi.mocked(capturePixels)).toHaveBeenCalledTimes(2);
+  });
+
   it("captures a snapshot only after the real combined settle observes pixels stop moving", async () => {
     const shotPath = path.join(tmpDir, "snapshot.png");
     const png = Buffer.alloc(24);
@@ -603,10 +636,12 @@ describe("pixel settle backstop", () => {
     } as unknown as ActionEnv;
 
     const pending = settleTree(env);
-    await vi.advanceTimersByTimeAsync(3_000);
+    await vi.advanceTimersByTimeAsync(5_000);
     const settled = await pending;
 
     expect(settled).toMatchObject({ tree: after, converged: false, treeFresh: true });
+    // The hung warm capture is bounded independently, then the moved tree
+    // restarts once and discovers the now-unavailable backend.
     expect(vi.mocked(capturePixels)).toHaveBeenCalledTimes(3);
   });
 
